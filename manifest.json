@@ -11,5 +11,5 @@
   "license": "MIT",
   "keywords": ["cli", "install", "audit", "sha256", "version", "claude", "codex", "opencode"],
   "tier": "js",
-  "permissions": ["ui:settings-section", "ui:command", "exec:powershell"]
+  "permissions": ["ui:settings-section", "ui:command", "exec:powershell", "storage"]
 }

@@ -6,7 +6,7 @@ const ENGINES = [
   { id: 'codex', label: 'Codex', cmds: ['codex', 'codex-cli'] },
   { id: 'opencode', label: 'OpenCode', cmds: ['opencode'] },
   { id: 'qoder', label: 'Qoder', cmds: ['qoder'] },
-  { id: 'qoder-cn', label: 'Qoder (CN)', cmds: ['qoder-cn', 'qoder'] },
+  { id: 'qoder-cn', label: 'Qoder (CN)', cmds: ['qoder-cn'] },
   { id: 'kimi', label: 'Kimi CLI', cmds: ['kimi'] },
   { id: 'grok', label: 'Grok CLI', cmds: ['grok'] },
   { id: 'codebuddy', label: 'CodeBuddy', cmds: ['codebuddy'] },
@@ -14,7 +14,7 @@ const ENGINES = [
   { id: 'omp', label: 'OMP', cmds: ['omp'] },
   { id: 'dsh', label: 'DSH', cmds: ['dsh'] },
   { id: 'agy', label: 'AGY', cmds: ['agy'] },
-  { id: 'pi', label: 'Pi', cmds: ['pi', 'hermes'] },
+  { id: 'pi', label: 'Pi', cmds: ['pi'] },
 ];
 
 const PS_TEMPLATE = String.raw`
@@ -22,14 +22,36 @@ $ErrorActionPreference = 'SilentlyContinue'
 $ProgressPreference = 'SilentlyContinue'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 
+$mode = '@@MODE@@'
+$onlyId = '@@ENGINE@@'
 $engineDefs = '@@ENGINES@@' | ConvertFrom-Json
 
-$out = [ordered]@{
-  processCount = 0
-  engines      = @()
+# ---------- discover：只做命令发现，不算哈希 ----------
+if ($mode -eq 'discover') {
+  $list = @()
+  foreach ($def in $engineDefs) {
+    $resolved = @()
+    foreach ($cmd in @($def.cmds)) {
+      if (Get-Command $cmd -ErrorAction SilentlyContinue) { $resolved += [string]$cmd }
+    }
+    $list += [ordered]@{
+      id       = [string]$def.id
+      label    = [string]$def.label
+      cmds     = [object[]]@($def.cmds)
+      resolved = [object[]]$resolved
+    }
+  }
+  @{ engines = [object[]]$list } | ConvertTo-Json -Depth 6 -Compress
+  exit 0
 }
 
-# 进程快照：同时用于父进程链回溯与运行中分组
+# ---------- detail：只扫一个引擎 ----------
+$def = $engineDefs | Where-Object { $_.id -eq $onlyId } | Select-Object -First 1
+if (-not $def) {
+  @{ error = 'unknown engine: ' + $onlyId } | ConvertTo-Json -Compress
+  exit 0
+}
+
 $allProc = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
 $procTable = @{}
 foreach ($p in $allProc) { $procTable[[int]$p.ProcessId] = $p }
@@ -68,7 +90,6 @@ foreach ($p in $allProc) {
   $owner = Get-OwnerKind (Get-AncestorNames ([int]$p.ParentProcessId))
   if ($g['owners'] -notcontains $owner) { $g['owners'] += $owner }
 }
-$out.processCount = $procGroups.Count
 
 function Resolve-Shim([string]$p) {
   $dir = Split-Path -Parent $p
@@ -84,7 +105,7 @@ function Resolve-Shim([string]$p) {
   return $null
 }
 
-# 带超时的版本读取，避免某个 CLI 不支持 --version 时卡住整次检测
+# 带超时的版本读取，避免某个 CLI 不支持 --version 时卡住
 function Get-CliVersion([string]$exe) {
   try {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -110,78 +131,73 @@ function Get-CliVersion([string]$exe) {
   return $null
 }
 
-$hashCache = @{}
-$verCache = @{}
+$installs = @()
+$seen = @{}
+$resolvedCmds = @()
 
-foreach ($def in $engineDefs) {
-  $installs = @()
-  $seen = @{}
-  $resolvedCmds = @()
+foreach ($cmd in @($def.cmds)) {
+  $found = @(Get-Command $cmd -All -ErrorAction SilentlyContinue)
+  if ($found.Count -gt 0) { $resolvedCmds += [string]$cmd }
 
-  foreach ($cmd in @($def.cmds)) {
-    $found = @(Get-Command $cmd -All -ErrorAction SilentlyContinue)
-    if ($found.Count -gt 0) { $resolvedCmds += [string]$cmd }
+  foreach ($c in $found) {
+    $src = $null
+    if ($c.Source) { $src = [string]$c.Source }
+    elseif ($c.Path) { $src = [string]$c.Path }
+    if (-not $src) { continue }
+    if ($src -notmatch '\.(exe|cmd|bat)$') { continue }
+    if (-not (Test-Path -LiteralPath $src)) { continue }
 
-    foreach ($c in $found) {
-      $src = $null
-      if ($c.Source) { $src = [string]$c.Source }
-      elseif ($c.Path) { $src = [string]$c.Path }
-      if (-not $src) { continue }
-      if ($src -notmatch '\.(exe|cmd|bat)$') { continue }
-      if (-not (Test-Path -LiteralPath $src)) { continue }
+    $target = $src
+    if ($src -match '\.(cmd|bat)$') {
+      $rs = Resolve-Shim $src
+      if ($rs) { $target = $rs }
+    }
+    $key = $target.ToLowerInvariant()
+    if ($seen.ContainsKey($key)) { continue }
+    $seen[$key] = $true
 
-      $target = $src
-      if ($src -match '\.(cmd|bat)$') {
-        $rs = Resolve-Shim $src
-        if ($rs) { $target = $rs }
-      }
-      $key = $target.ToLowerInvariant()
-      if ($seen.ContainsKey($key)) { continue }
-      $seen[$key] = $true
+    $ver = $null
+    if ($target -match '\.exe$') { $ver = Get-CliVersion $target }
 
-      if (-not $verCache.ContainsKey($key)) {
-        $verCache[$key] = $(if ($target -match '\.exe$') { Get-CliVersion $target } else { $null })
-      }
-      if (-not $hashCache.ContainsKey($key)) {
-        try { $hashCache[$key] = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLower() }
-        catch { $hashCache[$key] = $null }
-      }
+    $hash = $null
+    try { $hash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLower() } catch {}
 
-      $size = 0
-      try { $size = [long](Get-Item -LiteralPath $target).Length } catch {}
+    $size = 0
+    try { $size = [long](Get-Item -LiteralPath $target).Length } catch {}
 
-      $pg = $procGroups[$key]
-      $ownerList = @()
-      $pc = 0
-      if ($pg) { $pc = [int]$pg.count; $ownerList = @($pg.owners) }
+    $pg = $procGroups[$key]
+    $ownerList = @()
+    $pc = 0
+    if ($pg) { $pc = [int]$pg.count; $ownerList = @($pg.owners) }
 
-      $installs += [ordered]@{
-        entry        = $src
-        target       = $target
-        version      = $verCache[$key]
-        sha256       = $hashCache[$key]
-        size         = $size
-        processCount = $pc
-        owners       = [object[]]$ownerList
-      }
+    $installs += [ordered]@{
+      entry        = $src
+      target       = $target
+      version      = $ver
+      sha256       = $hash
+      size         = $size
+      processCount = $pc
+      owners       = [object[]]$ownerList
     }
   }
+}
 
-  $out.engines += [ordered]@{
+@{
+  engine = [ordered]@{
     id       = [string]$def.id
     label    = [string]$def.label
     cmds     = [object[]]@($def.cmds)
     resolved = [object[]]$resolvedCmds
     installs = [object[]]$installs
   }
-}
-
-$out | ConvertTo-Json -Depth 8 -Compress
+} | ConvertTo-Json -Depth 8 -Compress
 `;
 
-function buildScript() {
+function buildScript(mode, engineId) {
   const defs = ENGINES.map((e) => ({ id: e.id, label: e.label, cmds: e.cmds }));
-  return PS_TEMPLATE.replace('@@ENGINES@@', JSON.stringify(defs));
+  return PS_TEMPLATE.replace('@@ENGINES@@', JSON.stringify(defs))
+    .replace('@@MODE@@', mode)
+    .replace('@@ENGINE@@', engineId || '');
 }
 
 // PowerShell -EncodedCommand 需要 UTF-16LE 的 base64
@@ -206,6 +222,16 @@ function asArray(v) {
   return [v];
 }
 
+// 已安装的排前面，组内按显示名首字母排序
+function sortEngines(list) {
+  return [...list].sort((a, b) => {
+    const ai = a.resolved.length > 0 ? 0 : 1;
+    const bi = b.resolved.length > 0 ? 0 : 1;
+    if (ai !== bi) return ai - bi;
+    return String(a.label).localeCompare(String(b.label), 'en');
+  });
+}
+
 function fmtSize(n) {
   if (!n) return '-';
   return (n / 1024 / 1024).toFixed(1) + ' MiB';
@@ -219,28 +245,93 @@ function shortHash(h) {
 export default function activate(ctx) {
   const { createElement: h, useState, useEffect, useCallback } = ctx.react;
 
-  let autoRan = false;
-  let cache = null;
+  const CACHE_KEY = 'audit-cache-v1';
 
-  async function runAudit() {
+  // 会话内缓存：引擎列表 + 每个引擎的详情，设置页重挂载或切换回来都不重扫
+  const cache = { engines: null, details: {}, savedAt: null };
+
+  // Date 序列化成 ISO 字符串存盘，读回时还原成 Date
+  function normalizeDetails(raw) {
+    const out = {};
+    for (const [id, d] of Object.entries(raw || {})) {
+      if (!d) continue;
+      out[id] = d.engine ? { engine: d.engine, at: d.at ? new Date(d.at) : null } : d;
+    }
+    return out;
+  }
+
+  async function persist() {
+    if (!ctx.storage) return;
+    try {
+      const details = {};
+      for (const [id, d] of Object.entries(cache.details)) {
+        if (!d) continue;
+        details[id] = d.engine
+          ? { engine: d.engine, at: d.at instanceof Date ? d.at.toISOString() : d.at }
+          : d;
+      }
+      cache.savedAt = Date.now();
+      await ctx.storage.set(CACHE_KEY, {
+        version: 1,
+        engines: cache.engines,
+        details,
+        savedAt: cache.savedAt,
+      });
+    } catch {
+      // 存储不可用时静默降级为纯内存缓存
+    }
+  }
+
+  // 启动时恢复上次结果；不阻塞 activate，组件首次渲染时再等它
+  const restorePromise = (async () => {
+    if (!ctx.storage) return;
+    try {
+      const saved = await ctx.storage.get(CACHE_KEY);
+      if (saved && saved.version === 1 && Array.isArray(saved.engines)) {
+        cache.engines = saved.engines;
+        cache.details = normalizeDetails(saved.details);
+        cache.savedAt = saved.savedAt || null;
+      }
+    } catch {
+      // 读不到就当没有缓存
+    }
+  })();
+
+  async function exec(mode, engineId) {
     const r = await ctx.bridge.invoke('plugin_exec_run', {
       bin: 'powershell',
-      args: ['-NoProfile', '-NonInteractive', '-EncodedCommand', toEncodedCommand(buildScript())],
-      timeoutMs: 120000,
+      args: ['-NoProfile', '-NonInteractive', '-EncodedCommand', toEncodedCommand(buildScript(mode, engineId))],
+      timeoutMs: mode === 'discover' ? 30000 : 120000,
     });
     if (r && typeof r.code === 'number' && r.code !== 0) {
       throw new Error((r.stderr || '').trim() || 'powershell 退出码 ' + r.code);
     }
     const text = String((r && r.stdout) || '').replace(/^﻿/, '').trim();
     if (!text) throw new Error('没有拿到输出');
-    const data = JSON.parse(text);
-    data.engines = asArray(data.engines).map((e) => ({
+    return JSON.parse(text);
+  }
+
+  async function discover() {
+    const d = await exec('discover', '');
+    return asArray(d.engines).map((e) => ({
       ...e,
       cmds: asArray(e.cmds),
       resolved: asArray(e.resolved),
-      installs: asArray(e.installs),
     }));
-    return data;
+  }
+
+  async function loadDetail(engineId) {
+    const d = await exec('detail', engineId);
+    if (d && d.error) throw new Error(d.error);
+    return {
+      engine: {
+        ...d.engine,
+        cmds: asArray(d.engine.cmds),
+        resolved: asArray(d.engine.resolved),
+        installs: asArray(d.engine.installs),
+      },
+      at: new Date(),
+    };
   }
 
   function engineVerdict(eng) {
@@ -274,32 +365,74 @@ export default function activate(ctx) {
   }
 
   function SettingsPanel() {
-    const [phase, setPhase] = useState(cache ? 'done' : 'idle');
-    const [data, setData] = useState(cache ? cache.data : null);
+    const [engines, setEngines] = useState(cache.engines || []);
+    const [discoverPhase, setDiscoverPhase] = useState(cache.engines ? 'done' : 'idle');
+    const [selectedId, setSelectedId] = useState('');
+    const [details, setDetails] = useState(cache.details);
+    const [runningId, setRunningId] = useState(null);
     const [error, setError] = useState(null);
-    const [checkedAt, setCheckedAt] = useState(cache ? cache.checkedAt : null);
+    const [pickerFocused, setPickerFocused] = useState(false);
+    const [open, setOpen] = useState(false);
+    const [hoverId, setHoverId] = useState(null);
 
-    const refresh = useCallback(async () => {
-      setPhase('running');
+    const runDiscover = useCallback(async () => {
+      setDiscoverPhase('running');
       setError(null);
       try {
-        const d = await runAudit();
-        const at = new Date();
-        cache = { data: d, checkedAt: at };
-        setData(d);
-        setCheckedAt(at);
-        setPhase('done');
+        const list = await discover();
+        cache.engines = list;
+        setEngines(list);
+        setDiscoverPhase('done');
+        const ordered = sortEngines(list);
+        setSelectedId((prev) => {
+          if (prev && ordered.some((e) => e.id === prev)) return prev;
+          return ordered[0] ? ordered[0].id : '';
+        });
+        void persist();
       } catch (e) {
         setError(String((e && e.message) || e));
-        setPhase('error');
+        setDiscoverPhase('error');
       }
     }, []);
 
     useEffect(() => {
-      if (autoRan) return;
-      autoRan = true;
-      void refresh();
-    }, [refresh]);
+      if (cache.engines) return;
+      let alive = true;
+      void restorePromise.then(() => {
+        if (!alive) return;
+        if (cache.engines) {
+          setEngines(cache.engines);
+          setDiscoverPhase('done');
+          setDetails({ ...cache.details });
+          setSelectedId(sortEngines(cache.engines)[0]?.id || '');
+        } else {
+          void runDiscover();
+        }
+      });
+      return () => {
+        alive = false;
+      };
+    }, [runDiscover]);
+
+    const runDetail = useCallback(async (id, force) => {
+      if (!id) return;
+      if (!force && cache.details[id] && cache.details[id].engine) {
+        setDetails({ ...cache.details });
+        return;
+      }
+      setRunningId(id);
+      try {
+        const d = await loadDetail(id);
+        cache.details[id] = d;
+        setDetails({ ...cache.details });
+        void persist();
+      } catch (e) {
+        cache.details[id] = { error: String((e && e.message) || e) };
+        setDetails({ ...cache.details });
+      } finally {
+        setRunningId((cur) => (cur === id ? null : cur));
+      }
+    }, []);
 
     const t = {
       border: 'var(--color-separator-border, rgba(127,127,127,0.3))',
@@ -308,7 +441,6 @@ export default function activate(ctx) {
       text2: 'var(--color-text-secondary, inherit)',
       text3: 'var(--color-text-tertiary, inherit)',
       hover: 'var(--color-background-tertiary-hover, rgba(127,127,127,0.15))',
-      btnBorder: 'var(--color-border-button-default, rgba(127,127,127,0.4))',
       mono: 'ui-monospace, Consolas, "Courier New", monospace',
     };
 
@@ -328,15 +460,106 @@ export default function activate(ctx) {
       path: { fontFamily: t.mono, fontSize: 11, wordBreak: 'break-all', color: t.text2 },
       meta: { color: t.text3, fontSize: 12 },
       btn: {
-        padding: '4px 10px',
-        borderRadius: 6,
-        border: '1px solid ' + t.btnBorder,
+        height: 30,
+        padding: '0 10px',
+        borderRadius: 7,
+        border: '1px solid ' + t.border,
         background: 'transparent',
         color: 'inherit',
         cursor: 'pointer',
         fontSize: 12,
+        lineHeight: 1,
+        transition: 'background 120ms ease',
+      },
+      trigger: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: 8,
+        height: 30,
+        minWidth: 200,
+        maxWidth: 280,
+        padding: '0 10px',
+        borderRadius: 7,
+        border: '1px solid ' + (open || pickerFocused ? 'var(--color-accent-primary-default, #3b82f6)' : t.border),
+        background: open ? t.hover : 'transparent',
+        color: 'inherit',
+        fontSize: 12,
+        cursor: 'pointer',
+        outline: 'none',
+        textAlign: 'left',
+        transition: 'border-color 120ms ease, background 120ms ease',
+      },
+      triggerText: {
+        flex: '1 1 auto',
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap',
+      },
+      caret: {
+        flex: 'none',
+        fontSize: 8,
+        lineHeight: 1,
+        color: t.text3,
+        transform: open ? 'rotate(180deg)' : 'none',
+        transition: 'transform 120ms ease',
+      },
+      dropdown: {
+        position: 'relative',
+        display: 'inline-flex',
+      },
+      menu: {
+        position: 'absolute',
+        top: 'calc(100% + 6px)',
+        left: 0,
+        zIndex: 50,
+        minWidth: '100%',
+        width: 'max-content',
+        maxWidth: 320,
+        padding: 4,
+        background: 'var(--color-background-secondary-default, #242a35)',
+        color: 'var(--color-text-primary, inherit)',
+        border: '1px solid ' + t.border,
+        borderRadius: 8,
+        boxShadow: '0 4px 16px rgba(0,0,0,0.12)',
+      },
+      groupTitle: {
+        padding: '6px 8px 2px',
+        fontSize: 11,
+        color: t.text3,
+        userSelect: 'none',
+      },
+      menuItem: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: 8,
+        height: 28,
+        padding: '0 8px',
+        borderRadius: 6,
+        cursor: 'pointer',
+        fontSize: 12,
+      },
+      btnPrimary: {
+        height: 30,
+        padding: '0 14px',
+        borderRadius: 7,
+        border: '1px solid transparent',
+        background: 'var(--color-accent-primary-default, #3b82f6)',
+        color: '#fff',
+        cursor: 'pointer',
+        fontSize: 12,
+        fontWeight: 500,
+        transition: 'opacity 120ms ease',
       },
     };
+
+    const ordered = sortEngines(engines);
+    const installedList = ordered.filter((e) => e.resolved.length > 0);
+    const missingList = ordered.filter((e) => e.resolved.length === 0);
+    const installedCount = installedList.length;
+    const selected = ordered.find((e) => e.id === selectedId) || null;
+    const detail = selectedId ? details[selectedId] : null;
+    const isRunning = runningId === selectedId;
+    const hasResult = !!(detail && detail.engine);
 
     const head = h(
       'div',
@@ -345,27 +568,35 @@ export default function activate(ctx) {
       h(
         'button',
         {
-          style: { ...style.btn, marginLeft: 'auto', background: phase === 'running' ? t.hover : 'transparent' },
-          disabled: phase === 'running',
-          onClick: () => void refresh(),
+          style: { ...style.btn, marginLeft: 'auto', background: discoverPhase === 'running' ? t.hover : 'transparent' },
+          disabled: discoverPhase === 'running',
+          onClick: () => void runDiscover(),
         },
-        phase === 'running' ? '检测中…' : '重新检测',
+        discoverPhase === 'running' ? '扫描中…' : '重新发现',
       ),
     );
 
     const hint = h(
       'div',
       { style: style.hint },
-      '逐个探测 ' + ENGINES.length + ' 个 CC GUI 引擎的命令入口，展开 shim 后比较版本与 SHA256。引擎较多时首次检测可能需要十几秒。',
+      '先只检查命令是否存在，选中引擎后才读取版本、SHA256 与运行中进程。',
     );
 
-    if (phase === 'idle') return h('div', { style: style.root }, head, hint);
-
-    if (phase === 'running' && !data) {
-      return h('div', { style: style.root }, head, hint, h('div', { style: style.meta }, '正在读取文件哈希…'));
+    if ((discoverPhase === 'running' || discoverPhase === 'idle') && engines.length === 0) {
+      return h(
+        'div',
+        { style: style.root },
+        head,
+        hint,
+        h(
+          'div',
+          { style: style.meta },
+          discoverPhase === 'idle' ? '正在读取上次结果…' : '正在扫描 PATH…',
+        ),
+      );
     }
 
-    if (phase === 'error') {
+    if (discoverPhase === 'error') {
       return h(
         'div',
         { style: style.root },
@@ -378,26 +609,206 @@ export default function activate(ctx) {
             'div',
             { style: style.row },
             h('span', { style: { ...style.dot, background: VERDICT.diverged.dot } }),
-            h('span', null, '检测失败：' + error),
+            h('span', null, '扫描失败：' + error),
           ),
         ),
       );
     }
 
-    const engines = data ? asArray(data.engines) : [];
-    const installed = engines.filter((e) => asArray(e.installs).length > 0);
-    const problems = installed.filter((e) => {
-      const k = engineVerdict(e).kind;
-      return k === 'warn' || k === 'diverged';
-    });
-    const overall = {
-      dot: problems.length > 0 ? VERDICT.diverged.dot : installed.length > 0 ? VERDICT.same.dot : VERDICT.missing.dot,
-      text:
-        installed.length > 0
-          ? installed.length + ' / ' + engines.length + ' 个引擎已安装' +
-            (problems.length > 0 ? '，' + problems.length + ' 个存在差异' : '，全部一致')
-          : '没有探测到任何已安装的 CLI',
+    const summaryDot =
+      installedCount > 0 ? VERDICT.same.dot : VERDICT.missing.dot;
+
+    const menuItem = (e) => {
+      const active = e.id === selectedId;
+      const hovered = hoverId === e.id;
+      return h(
+        'div',
+        {
+          key: e.id,
+          'data-engine': e.id,
+          role: 'option',
+          'aria-selected': active,
+          onMouseEnter: () => setHoverId(e.id),
+          onMouseLeave: () => setHoverId((cur) => (cur === e.id ? null : cur)),
+          onClick: () => {
+            setOpen(false);
+            setHoverId(null);
+            if (e.id !== selectedId) setSelectedId(e.id);
+            void runDetail(e.id, false);
+          },
+          style: {
+            ...style.menuItem,
+            background: hovered
+              ? 'var(--color-background-tertiary-hover, rgba(127,127,127,0.15))'
+              : active
+                ? 'var(--color-background-tertiary-default, rgba(127,127,127,0.1))'
+                : 'transparent',
+            color: 'inherit',
+            fontWeight: active ? 500 : 400,
+          },
+        },
+        h(
+          'span',
+          {
+            style: {
+              width: 12,
+              flex: 'none',
+              opacity: active ? 1 : 0,
+              color: 'var(--color-accent-primary-default, #3b82f6)',
+              fontSize: 11,
+            },
+          },
+          '✓',
+        ),
+        h('span', { style: { flex: '1 1 auto' } }, e.label),
+      );
     };
+
+    const menuBody = [];
+    if (installedList.length > 0) {
+      menuBody.push(h('div', { key: 'h-on', style: style.groupTitle }, '已安装'));
+      for (const e of installedList) menuBody.push(menuItem(e));
+    }
+    if (missingList.length > 0) {
+      menuBody.push(h('div', { key: 'h-off', style: style.groupTitle }, '未安装'));
+      for (const e of missingList) menuBody.push(menuItem(e));
+    }
+
+    const picker = h(
+      'div',
+      { style: { ...style.card, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
+      h('span', { style: { ...style.meta, flex: 'none' } }, '引擎'),
+      h(
+        'div',
+        { style: style.dropdown },
+        h(
+          'button',
+          {
+            type: 'button',
+            'data-role': 'engine-trigger',
+            'aria-haspopup': 'listbox',
+            'aria-expanded': open,
+            style: style.trigger,
+            onFocus: () => setPickerFocused(true),
+            onBlur: () => setPickerFocused(false),
+            onClick: () => setOpen((v) => !v),
+          },
+          h('span', { style: style.triggerText }, selected ? selected.label : '选择引擎'),
+          h('span', { style: style.caret }, '▼'),
+        ),
+        open && h('div', { style: style.menu, role: 'listbox', 'data-role': 'engine-menu' }, menuBody),
+      ),
+      h(
+        'button',
+        {
+          style: {
+            ...style.btnPrimary,
+            marginLeft: 'auto',
+            opacity: isRunning ? 0.65 : 1,
+            cursor: isRunning ? 'default' : 'pointer',
+          },
+          disabled: isRunning,
+          onClick: () => void runDetail(selectedId, hasResult),
+        },
+        isRunning ? '检测中…' : hasResult ? '重新检测' : '检测',
+      ),
+      // 点击任意空白处收起下拉
+      open &&
+        h('div', {
+          style: { position: 'fixed', inset: 0, zIndex: 40 },
+          onClick: () => setOpen(false),
+        }),
+    );
+
+    let body = null;
+
+    if (!selected) {
+      body = null;
+    } else if (isRunning && !detail) {
+      body = h(
+        'div',
+        { style: style.card },
+        h('div', { style: style.meta }, '正在读取 ' + selected.label + ' 的版本与文件哈希…'),
+      );
+    } else if (detail && detail.error) {
+      body = h(
+        'div',
+        { style: style.card },
+        h(
+          'div',
+          { style: style.row },
+          h('span', { style: { ...style.dot, background: VERDICT.diverged.dot } }),
+          h('span', null, '检测失败：' + detail.error),
+        ),
+      );
+    } else if (detail && detail.engine) {
+      const eng = detail.engine;
+      const installs = asArray(eng.installs);
+      const v = engineVerdict(eng);
+
+      body = h(
+        'div',
+        { style: style.card },
+        h(
+          'div',
+          { style: style.row },
+          h('span', { style: { fontWeight: 600 } }, eng.label),
+          h('span', { style: { ...style.dot, background: VERDICT[v.kind].dot } }),
+          h('span', null, v.text),
+          installs.length > 0 &&
+            h('span', { style: { ...style.meta, marginLeft: 'auto' } }, installs.length + ' 个入口'),
+        ),
+
+        installs.length === 0 &&
+          h(
+            'div',
+            { style: { ...style.meta, marginTop: 2 } },
+            '探测命令：' + asArray(eng.cmds).join(', ') + '（PATH 中没有找到）',
+          ),
+
+        installs.map((it, i) =>
+          h(
+            'div',
+            { key: 'i' + i, style: { marginTop: 8 } },
+            h(
+              'div',
+              { style: style.row },
+              h('span', { style: { fontWeight: 500 } }, it.version || '(版本未读取)'),
+              h('span', { style: style.meta }, fmtSize(it.size)),
+              it.processCount > 0 &&
+                h(
+                  'span',
+                  { style: style.meta },
+                  '运行中 ×' + it.processCount + (ownerLabel(it) ? ' · ' + ownerLabel(it) : ''),
+                ),
+              h('span', { style: { ...style.meta, marginLeft: 'auto' } }, shortHash(it.sha256)),
+            ),
+            h('div', { style: style.path }, it.target),
+            it.entry !== it.target &&
+              h('div', { style: { ...style.path, color: t.text3 } }, '入口：' + it.entry),
+          ),
+        ),
+
+        detail.at &&
+          h(
+            'div',
+            { style: { ...style.meta, marginTop: 8 } },
+            '检测于 ' + detail.at.toLocaleString(),
+          ),
+      );
+    } else {
+      body = h(
+        'div',
+        { style: style.card },
+        h(
+          'div',
+          { style: style.meta },
+          selected.resolved.length > 0
+            ? '已找到 ' + selected.resolved.join(', ') + '，点击「检测」读取详情。'
+            : '探测命令：' + asArray(selected.cmds).join(', ') + '（PATH 中没有找到）',
+        ),
+      );
+    }
 
     return h(
       'div',
@@ -411,60 +822,19 @@ export default function activate(ctx) {
         h(
           'div',
           { style: style.row },
-          h('span', { style: { ...style.dot, background: overall.dot } }),
-          h('span', { style: { fontWeight: 600 } }, overall.text),
+          h('span', { style: { ...style.dot, background: summaryDot } }),
+          h('span', { style: { fontWeight: 600 } }, installedCount + ' / ' + engines.length + ' 个引擎已安装'),
+          cache.savedAt &&
+            h(
+              'span',
+              { style: { ...style.meta, marginLeft: 'auto' } },
+              '缓存于 ' + new Date(cache.savedAt).toLocaleString(),
+            ),
         ),
       ),
 
-      engines.map((eng) => {
-        const installs = asArray(eng.installs);
-        const v = engineVerdict(eng);
-        return h(
-          'div',
-          { key: eng.id, style: style.card },
-          h(
-            'div',
-            { style: style.row },
-            h('span', { style: { fontWeight: 600, minWidth: 100 } }, eng.label),
-            h('span', { style: { ...style.dot, background: VERDICT[v.kind].dot } }),
-            h('span', null, v.text),
-            installs.length > 0 &&
-              h('span', { style: { ...style.meta, marginLeft: 'auto' } }, installs.length + ' 个入口'),
-          ),
-
-          installs.length === 0 &&
-            h(
-              'div',
-              { style: { ...style.meta, marginTop: 2 } },
-              '探测命令：' + asArray(eng.cmds).join(', ') + '（PATH 中没有找到）',
-            ),
-
-          installs.map((it, i) =>
-            h(
-              'div',
-              { key: 'i' + i, style: { marginTop: 8 } },
-              h(
-                'div',
-                { style: style.row },
-                h('span', { style: { fontWeight: 500 } }, it.version || '(版本未读取)'),
-                h('span', { style: style.meta }, fmtSize(it.size)),
-                it.processCount > 0 &&
-                  h(
-                    'span',
-                    { style: style.meta },
-                    '运行中 ×' + it.processCount + (ownerLabel(it) ? ' · ' + ownerLabel(it) : ''),
-                  ),
-                h('span', { style: { ...style.meta, marginLeft: 'auto' } }, shortHash(it.sha256)),
-              ),
-              h('div', { style: style.path }, it.target),
-              it.entry !== it.target &&
-                h('div', { style: { ...style.path, color: t.text3 } }, '入口：' + it.entry),
-            ),
-          ),
-        );
-      }),
-
-      checkedAt && h('div', { style: { ...style.meta, marginTop: 4 } }, '检测于 ' + checkedAt.toLocaleTimeString()),
+      picker,
+      body,
     );
   }
 
