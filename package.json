@@ -1,0 +1,11 @@
+{
+  "name": "ccgui-plugin-claude-install-audit",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "CC GUI 插件：检测本机多个 Claude Code 二进制是否一致",
+  "license": "MIT",
+  "scripts": {
+    "validate": "node scripts/validate-manifest.mjs"
+  }
+}

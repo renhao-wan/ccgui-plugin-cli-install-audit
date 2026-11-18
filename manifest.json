@@ -1,0 +1,15 @@
+{
+  "id": "claude-install-audit",
+  "name": "Claude 安装检测",
+  "version": "1.0.0",
+  "sdkVersion": "^0.3",
+  "minAppVersion": "1.0.4",
+  "author": "renhao-wan",
+  "description": "在插件设置页对比 PATH 解析、CC GUI 自带 SDK 与运行中进程的 Claude Code 二进制，显示版本与 SHA256 是否一致。",
+  "repo": "renhao-wan/ccgui-plugin-claude-install-audit",
+  "icon": "docs/icon.png",
+  "license": "MIT",
+  "keywords": ["claude", "install", "audit", "sha256", "version"],
+  "tier": "js",
+  "permissions": ["ui:settings-section", "ui:command", "exec:powershell"]
+}
