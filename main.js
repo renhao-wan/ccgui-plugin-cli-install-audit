@@ -1,34 +1,38 @@
-const PS_SCRIPT = String.raw`
+// 引擎清单：id 来自 ccgui-next.exe 的 AgentFrameProviderSection 枚举，
+// 候选命令名参考宿主的 npm/CLI 搜索目录常量（.codex-cli\bin、.omp\bin、OpenAI\Codex\bin 等）。
+// 名字对不上时只会显示「未安装」，不会误报。
+const ENGINES = [
+  { id: 'claude', label: 'Claude Code', cmds: ['claude'] },
+  { id: 'codex', label: 'Codex', cmds: ['codex', 'codex-cli'] },
+  { id: 'opencode', label: 'OpenCode', cmds: ['opencode'] },
+  { id: 'qoder', label: 'Qoder', cmds: ['qoder'] },
+  { id: 'qoder-cn', label: 'Qoder (CN)', cmds: ['qoder-cn', 'qoder'] },
+  { id: 'kimi', label: 'Kimi CLI', cmds: ['kimi'] },
+  { id: 'grok', label: 'Grok CLI', cmds: ['grok'] },
+  { id: 'codebuddy', label: 'CodeBuddy', cmds: ['codebuddy'] },
+  { id: 'minimax', label: 'MiniMax', cmds: ['minimax'] },
+  { id: 'omp', label: 'OMP', cmds: ['omp'] },
+  { id: 'dsh', label: 'DSH', cmds: ['dsh'] },
+  { id: 'agy', label: 'AGY', cmds: ['agy'] },
+  { id: 'pi', label: 'Pi', cmds: ['pi', 'hermes'] },
+];
+
+const PS_TEMPLATE = String.raw`
 $ErrorActionPreference = 'SilentlyContinue'
 $ProgressPreference = 'SilentlyContinue'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 
-function Resolve-Shim([string]$p) {
-  $dir = Split-Path -Parent $p
-  $raw = Get-Content -LiteralPath $p -Raw -ErrorAction SilentlyContinue
-  if (-not $raw) { return $null }
-  $t = $raw -replace '(?i)%~dp0\\?', ($dir + '\')
-  $t = $t -replace '(?i)%dp0%\\?', ($dir + '\')
-  $m = [regex]::Match($t, '"([^"\r\n]+?\.exe)"')
-  if (-not $m.Success) { $m = [regex]::Match($t, '([A-Za-z]:\\[^"\r\n]+?\.exe)') }
-  if (-not $m.Success) { return $null }
-  $cand = $m.Groups[1].Value
-  if (Test-Path -LiteralPath $cand) { return $cand }
-  return $null
-}
+$engineDefs = '@@ENGINES@@' | ConvertFrom-Json
 
 $out = [ordered]@{
-  candidates = @()
-  running    = @()
-  processes  = @()
-  installs   = @()
+  processCount = 0
+  engines      = @()
 }
 
-# 全量进程表（只取轻量字段），用于回溯父进程链判断 claude 归属
+# 进程快照：同时用于父进程链回溯与运行中分组
+$allProc = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
 $procTable = @{}
-foreach ($p in Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name -ErrorAction SilentlyContinue) {
-  $procTable[[int]$p.ProcessId] = $p
-}
+foreach ($p in $allProc) { $procTable[[int]$p.ProcessId] = $p }
 
 function Get-AncestorNames([int]$startPid) {
   $names = @()
@@ -51,20 +55,8 @@ function Get-OwnerKind($names) {
   return 'other'
 }
 
-foreach ($c in Get-Command claude -All -ErrorAction SilentlyContinue) {
-  $src = $null
-  if ($c.Source) { $src = [string]$c.Source }
-  elseif ($c.Path) { $src = [string]$c.Path }
-  $out.candidates += [ordered]@{
-    name   = [string]$c.Name
-    type   = [string]$c.CommandType
-    source = $src
-  }
-}
-
-# 按可执行文件路径分组：同一路径多个实例合并计数，归属取父进程链
-$procGroups = [ordered]@{}
-foreach ($p in Get-CimInstance Win32_Process -Filter "Name='claude.exe'") {
+$procGroups = @{}
+foreach ($p in $allProc) {
   $ppath = [string]$p.ExecutablePath
   if (-not $ppath) { continue }
   $pkey = $ppath.ToLowerInvariant()
@@ -76,67 +68,121 @@ foreach ($p in Get-CimInstance Win32_Process -Filter "Name='claude.exe'") {
   $owner = Get-OwnerKind (Get-AncestorNames ([int]$p.ParentProcessId))
   if ($g['owners'] -notcontains $owner) { $g['owners'] += $owner }
 }
-$out.processes = @($procGroups.Values)
-$out.running = @($out.processes | ForEach-Object { $_.path })
+$out.processCount = $procGroups.Count
 
-$sdkPath = Join-Path $env:USERPROFILE '.codemoss\dependencies\claude-sdk\node_modules\@anthropic-ai\claude-agent-sdk-win32-x64\claude.exe'
-$entries = @()
-foreach ($c in $out.candidates) {
-  if ($c.source -and ($c.source -match '\.(exe|cmd|bat)$') -and (Test-Path -LiteralPath $c.source)) {
-    $entries += [ordered]@{ entry = $c.source; kind = 'path' }
-  }
-}
-if (Test-Path -LiteralPath $sdkPath) { $entries += [ordered]@{ entry = $sdkPath; kind = 'sdk' } }
-foreach ($r in $out.running) { $entries += [ordered]@{ entry = $r; kind = 'running' } }
-
-$procMap = @{}
-foreach ($g in $out.processes) { $procMap[[string]$g.path.ToLowerInvariant()] = $g }
-
-$seen = @{}
-foreach ($e in $entries) {
-  $entry = [string]$e.entry
-  $target = $entry
-  if ($entry -match '\.(cmd|bat)$') {
-    $resolved = Resolve-Shim $entry
-    if ($resolved) { $target = $resolved }
-  }
-  $key = $target.ToLower()
-  if ($seen.ContainsKey($key)) { continue }
-  $seen[$key] = $true
-
-  $ver = $null
-  if ($target -match '\.exe$') {
-    try {
-      $v = & $target --version 2>$null | Select-Object -First 1
-      if ($v) { $ver = ([string]$v).Trim() }
-    } catch {}
-  }
-  $hash = $null
-  try { $hash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLower() } catch {}
-  $size = 0
-  try { $size = [long](Get-Item -LiteralPath $target).Length } catch {}
-
-  $pg = $procMap[[string]$target.ToLowerInvariant()]
-  $procCount = 0
-  $ownerList = @()
-  if ($pg) {
-    $procCount = [int]$pg.count
-    $ownerList = @($pg.owners)
-  }
-  $out.installs += [ordered]@{
-    entry        = $entry
-    target       = $target
-    kind         = $(if ($pg) { 'running' } elseif ($entry -match '\.codemoss\\') { 'sdk' } else { 'path' })
-    version      = $ver
-    sha256       = $hash
-    size         = $size
-    processCount = $procCount
-    owners       = [object[]]$ownerList
-  }
+function Resolve-Shim([string]$p) {
+  $dir = Split-Path -Parent $p
+  $raw = Get-Content -LiteralPath $p -Raw -ErrorAction SilentlyContinue
+  if (-not $raw) { return $null }
+  $t = $raw -replace '(?i)%~dp0\\?', ($dir + '\')
+  $t = $t -replace '(?i)%dp0%\\?', ($dir + '\')
+  $m = [regex]::Match($t, '"([^"\r\n]+?\.exe)"')
+  if (-not $m.Success) { $m = [regex]::Match($t, '([A-Za-z]:\\[^"\r\n]+?\.exe)') }
+  if (-not $m.Success) { return $null }
+  $cand = $m.Groups[1].Value
+  if (Test-Path -LiteralPath $cand) { return $cand }
+  return $null
 }
 
-$out | ConvertTo-Json -Depth 6 -Compress
+# 带超时的版本读取，避免某个 CLI 不支持 --version 时卡住整次检测
+function Get-CliVersion([string]$exe) {
+  try {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    $psi.Arguments = '--version'
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    if ($proc.WaitForExit(4000)) {
+      $so = $proc.StandardOutput.ReadToEnd()
+      $se = $proc.StandardError.ReadToEnd()
+      $text = ([string]$so + ' ' + [string]$se).Trim()
+      if ($text) {
+        $line = ($text -split '\r?\n' | Where-Object { $_.Trim() } | Select-Object -First 1)
+        if ($line) { return [string]$line.Trim() }
+      }
+    } else {
+      try { $proc.Kill() } catch {}
+    }
+  } catch {}
+  return $null
+}
+
+$hashCache = @{}
+$verCache = @{}
+
+foreach ($def in $engineDefs) {
+  $installs = @()
+  $seen = @{}
+  $resolvedCmds = @()
+
+  foreach ($cmd in @($def.cmds)) {
+    $found = @(Get-Command $cmd -All -ErrorAction SilentlyContinue)
+    if ($found.Count -gt 0) { $resolvedCmds += [string]$cmd }
+
+    foreach ($c in $found) {
+      $src = $null
+      if ($c.Source) { $src = [string]$c.Source }
+      elseif ($c.Path) { $src = [string]$c.Path }
+      if (-not $src) { continue }
+      if ($src -notmatch '\.(exe|cmd|bat)$') { continue }
+      if (-not (Test-Path -LiteralPath $src)) { continue }
+
+      $target = $src
+      if ($src -match '\.(cmd|bat)$') {
+        $rs = Resolve-Shim $src
+        if ($rs) { $target = $rs }
+      }
+      $key = $target.ToLowerInvariant()
+      if ($seen.ContainsKey($key)) { continue }
+      $seen[$key] = $true
+
+      if (-not $verCache.ContainsKey($key)) {
+        $verCache[$key] = $(if ($target -match '\.exe$') { Get-CliVersion $target } else { $null })
+      }
+      if (-not $hashCache.ContainsKey($key)) {
+        try { $hashCache[$key] = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLower() }
+        catch { $hashCache[$key] = $null }
+      }
+
+      $size = 0
+      try { $size = [long](Get-Item -LiteralPath $target).Length } catch {}
+
+      $pg = $procGroups[$key]
+      $ownerList = @()
+      $pc = 0
+      if ($pg) { $pc = [int]$pg.count; $ownerList = @($pg.owners) }
+
+      $installs += [ordered]@{
+        entry        = $src
+        target       = $target
+        version      = $verCache[$key]
+        sha256       = $hashCache[$key]
+        size         = $size
+        processCount = $pc
+        owners       = [object[]]$ownerList
+      }
+    }
+  }
+
+  $out.engines += [ordered]@{
+    id       = [string]$def.id
+    label    = [string]$def.label
+    cmds     = [object[]]@($def.cmds)
+    resolved = [object[]]$resolvedCmds
+    installs = [object[]]$installs
+  }
+}
+
+$out | ConvertTo-Json -Depth 8 -Compress
 `;
+
+function buildScript() {
+  const defs = ENGINES.map((e) => ({ id: e.id, label: e.label, cmds: e.cmds }));
+  return PS_TEMPLATE.replace('@@ENGINES@@', JSON.stringify(defs));
+}
 
 // PowerShell -EncodedCommand 需要 UTF-16LE 的 base64
 function toEncodedCommand(script) {
@@ -173,43 +219,47 @@ function shortHash(h) {
 export default function activate(ctx) {
   const { createElement: h, useState, useEffect, useCallback } = ctx.react;
 
-  // 同一插件实例内缓存，设置页重新挂载时不必重跑
   let autoRan = false;
   let cache = null;
 
   async function runAudit() {
     const r = await ctx.bridge.invoke('plugin_exec_run', {
       bin: 'powershell',
-      args: ['-NoProfile', '-NonInteractive', '-EncodedCommand', toEncodedCommand(PS_SCRIPT)],
-      timeoutMs: 30000,
+      args: ['-NoProfile', '-NonInteractive', '-EncodedCommand', toEncodedCommand(buildScript())],
+      timeoutMs: 120000,
     });
     if (r && typeof r.code === 'number' && r.code !== 0) {
       throw new Error((r.stderr || '').trim() || 'powershell 退出码 ' + r.code);
     }
     const text = String((r && r.stdout) || '').replace(/^﻿/, '').trim();
-    if (!text) throw new Error('没有拿到输出，可能是 PATH 中没有 claude');
+    if (!text) throw new Error('没有拿到输出');
     const data = JSON.parse(text);
-    data.candidates = asArray(data.candidates);
-    data.running = asArray(data.running);
-    data.installs = asArray(data.installs);
+    data.engines = asArray(data.engines).map((e) => ({
+      ...e,
+      cmds: asArray(e.cmds),
+      resolved: asArray(e.resolved),
+      installs: asArray(e.installs),
+    }));
     return data;
   }
 
-  function verdictOf(installs) {
+  function engineVerdict(eng) {
+    const installs = asArray(eng.installs);
+    if (installs.length === 0) return { kind: 'missing', text: '未安装' };
     const hashes = [...new Set(installs.map((x) => x.sha256).filter(Boolean))];
     const versions = [...new Set(installs.map((x) => x.version).filter(Boolean))];
-    if (hashes.length === 0) return { kind: 'unknown', text: '没有可读取的二进制' };
-    if (hashes.length === 1) return { kind: 'same', text: '所有入口指向同一个文件（SHA256 相同）' };
-    if (versions.length === 1) return { kind: 'warn', text: '版本相同，但文件不同（可能是不同构建）' };
-    return { kind: 'diverged', text: '版本已分叉，CC GUI 与终端可能不是同一个 Claude Code' };
+    if (hashes.length === 0) return { kind: 'unknown', text: '无法读取文件' };
+    if (hashes.length === 1) return { kind: 'same', text: '一致' };
+    if (versions.length === 1) return { kind: 'warn', text: '版本相同，文件不同' };
+    return { kind: 'diverged', text: '版本分叉' };
   }
 
-  // 只给圆点上色；正文一律用宿主文本 token，深浅主题下对比度都由宿主保证
-  const DOT = {
-    same: '#22c55e',
-    warn: '#eab308',
-    diverged: '#ef4444',
-    unknown: '#94a3b8',
+  const VERDICT = {
+    same: { dot: '#22c55e' },
+    warn: { dot: '#eab308' },
+    diverged: { dot: '#ef4444' },
+    unknown: { dot: '#94a3b8' },
+    missing: { dot: '#cbd5e1' },
   };
 
   const OWNER = { ccgui: 'CC GUI', terminal: '终端', other: '其他' };
@@ -218,7 +268,6 @@ export default function activate(ctx) {
   function ownerLabel(it) {
     return asArray(it.owners)
       .filter((o) => typeof o === 'string')
-      .slice()
       .sort((a, b) => OWNER_ORDER.indexOf(a) - OWNER_ORDER.indexOf(b))
       .map((o) => OWNER[o] || o)
       .join(' + ');
@@ -289,15 +338,10 @@ export default function activate(ctx) {
       },
     };
 
-    const verdict = data ? verdictOf(data.installs) : null;
-    const ccguiUse = data
-      ? data.installs.filter((x) => asArray(x.owners).indexOf('ccgui') >= 0)
-      : [];
-
     const head = h(
       'div',
       { style: style.head },
-      h('span', { style: { fontWeight: 600 } }, 'Claude Code 安装检测'),
+      h('span', { style: { fontWeight: 600 } }, 'CLI 安装检测'),
       h(
         'button',
         {
@@ -312,12 +356,10 @@ export default function activate(ctx) {
     const hint = h(
       'div',
       { style: style.hint },
-      '对比 PATH 解析顺序、CC GUI 自带 SDK、正在运行的 claude 进程；比较版本与 SHA256。首次检测约 3 秒。',
+      '逐个探测 ' + ENGINES.length + ' 个 CC GUI 引擎的命令入口，展开 shim 后比较版本与 SHA256。引擎较多时首次检测可能需要十几秒。',
     );
 
-    if (phase === 'idle') {
-      return h('div', { style: style.root }, head, hint);
-    }
+    if (phase === 'idle') return h('div', { style: style.root }, head, hint);
 
     if (phase === 'running' && !data) {
       return h('div', { style: style.root }, head, hint, h('div', { style: style.meta }, '正在读取文件哈希…'));
@@ -335,12 +377,27 @@ export default function activate(ctx) {
           h(
             'div',
             { style: style.row },
-            h('span', { style: { ...style.dot, background: DOT.diverged } }),
+            h('span', { style: { ...style.dot, background: VERDICT.diverged.dot } }),
             h('span', null, '检测失败：' + error),
           ),
         ),
       );
     }
+
+    const engines = data ? asArray(data.engines) : [];
+    const installed = engines.filter((e) => asArray(e.installs).length > 0);
+    const problems = installed.filter((e) => {
+      const k = engineVerdict(e).kind;
+      return k === 'warn' || k === 'diverged';
+    });
+    const overall = {
+      dot: problems.length > 0 ? VERDICT.diverged.dot : installed.length > 0 ? VERDICT.same.dot : VERDICT.missing.dot,
+      text:
+        installed.length > 0
+          ? installed.length + ' / ' + engines.length + ' 个引擎已安装' +
+            (problems.length > 0 ? '，' + problems.length + ' 个存在差异' : '，全部一致')
+          : '没有探测到任何已安装的 CLI',
+    };
 
     return h(
       'div',
@@ -348,91 +405,79 @@ export default function activate(ctx) {
       head,
       hint,
 
-      verdict &&
+      h(
+        'div',
+        { style: style.card },
         h(
           'div',
-          { style: style.card },
+          { style: style.row },
+          h('span', { style: { ...style.dot, background: overall.dot } }),
+          h('span', { style: { fontWeight: 600 } }, overall.text),
+        ),
+      ),
+
+      engines.map((eng) => {
+        const installs = asArray(eng.installs);
+        const v = engineVerdict(eng);
+        return h(
+          'div',
+          { key: eng.id, style: style.card },
           h(
             'div',
             { style: style.row },
-            h('span', { style: { ...style.dot, background: DOT[verdict.kind] } }),
-            h('span', { style: { fontWeight: 600 } }, verdict.text),
+            h('span', { style: { fontWeight: 600, minWidth: 100 } }, eng.label),
+            h('span', { style: { ...style.dot, background: VERDICT[v.kind].dot } }),
+            h('span', null, v.text),
+            installs.length > 0 &&
+              h('span', { style: { ...style.meta, marginLeft: 'auto' } }, installs.length + ' 个入口'),
           ),
-        ),
 
-      data &&
-        h(
-          'div',
-          { style: { ...style.card, background: 'transparent' } },
-          ccguiUse.length > 0
-            ? h(
-                'div',
-                null,
-                h('div', { style: { ...style.meta, marginBottom: 2 } }, 'CC GUI 正在使用：'),
-                ccguiUse.map((x, i) =>
-                  h('div', { key: 'g' + i, style: style.path }, (x.version || '?') + '   ' + x.target),
-                ),
-              )
-            : h(
-                'div',
-                { style: style.meta },
-                data.running.length > 0
-                  ? '有 claude 进程在运行，但不在 CC GUI 的进程树下（多为终端会话）。'
-                  : '当前没有运行中的 claude 进程，CC GUI 的实际路径取自自带 SDK。',
-              ),
-        ),
-
-      data &&
-        data.installs.map((it, i) =>
-          h(
-            'div',
-            { key: 'i' + i, style: style.card },
+          installs.length === 0 &&
             h(
               'div',
-              { style: style.row },
-              h('span', { style: { fontWeight: 600 } }, it.version || '(版本读取失败)'),
-              h('span', { style: style.meta }, fmtSize(it.size)),
-              it.processCount > 0 &&
-                h(
-                  'span',
-                  { style: style.meta },
-                  '· 运行中 ×' + it.processCount + (ownerLabel(it) ? ' · ' + ownerLabel(it) : ''),
-                ),
-              !it.processCount && it.kind === 'sdk' && h('span', { style: style.meta }, '· CC GUI 自带'),
-              !it.processCount && it.kind === 'path' && h('span', { style: style.meta }, '· PATH'),
+              { style: { ...style.meta, marginTop: 2 } },
+              '探测命令：' + asArray(eng.cmds).join(', ') + '（PATH 中没有找到）',
             ),
-            h('div', { style: style.path }, it.target),
-            it.entry !== it.target &&
-              h('div', { style: { ...style.path, color: t.text3 } }, '入口：' + it.entry),
-            h('div', { style: { ...style.path, color: t.text3 } }, 'sha256：' + shortHash(it.sha256)),
-          ),
-        ),
 
-      data &&
-        data.candidates.length > 0 &&
-        h(
-          'div',
-          { style: { ...style.card, background: 'transparent' } },
-          h('div', { style: { ...style.meta, marginBottom: 4 } }, 'PATH 解析顺序（前者优先）：'),
-          data.candidates.map((c, i) =>
-            h('div', { key: 'c' + i, style: style.path }, i + 1 + '. ' + c.name + '  —  ' + c.type),
+          installs.map((it, i) =>
+            h(
+              'div',
+              { key: 'i' + i, style: { marginTop: 8 } },
+              h(
+                'div',
+                { style: style.row },
+                h('span', { style: { fontWeight: 500 } }, it.version || '(版本未读取)'),
+                h('span', { style: style.meta }, fmtSize(it.size)),
+                it.processCount > 0 &&
+                  h(
+                    'span',
+                    { style: style.meta },
+                    '运行中 ×' + it.processCount + (ownerLabel(it) ? ' · ' + ownerLabel(it) : ''),
+                  ),
+                h('span', { style: { ...style.meta, marginLeft: 'auto' } }, shortHash(it.sha256)),
+              ),
+              h('div', { style: style.path }, it.target),
+              it.entry !== it.target &&
+                h('div', { style: { ...style.path, color: t.text3 } }, '入口：' + it.entry),
+            ),
           ),
-        ),
+        );
+      }),
 
-      checkedAt && h('div', { style: style.meta }, '检测于 ' + checkedAt.toLocaleTimeString()),
+      checkedAt && h('div', { style: { ...style.meta, marginTop: 4 } }, '检测于 ' + checkedAt.toLocaleTimeString()),
     );
   }
 
   ctx.ui.registerSettingsSection({
     key: 'diagnostics',
-    label: () => '安装检测',
+    label: () => 'CLI 安装检测',
     component: SettingsPanel,
   });
 
   ctx.ui.registerCommand({
-    key: 'claude-install-audit.open',
-    title: () => 'Claude 安装检测',
-    keywords: () => ['claude', 'install', 'audit', 'sha256', '安装', '版本'],
+    key: 'cli-install-audit.open',
+    title: () => 'CLI 安装检测',
+    keywords: () => ['cli', 'install', 'audit', 'sha256', 'claude', 'codex', 'opencode', '安装', '版本'],
     run: () => {
       ctx.ui.openSettings('diagnostics');
     },
