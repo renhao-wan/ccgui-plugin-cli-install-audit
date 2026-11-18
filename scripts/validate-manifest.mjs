@@ -73,6 +73,19 @@ if (!fs.existsSync(bundle)) {
     [/^\s*(?:const|let|var)\s+.+=\s*require\s*\(/m, 'require('],
   ];
   for (const [re, label] of banned) if (re.test(src)) fail(`main.js 命中黑名单：${label}`);
+
+  // 权限 ↔ 代码用法一致性：少声明时宿主会在运行期抛错或静默降级
+  const declared = new Set(m.permissions || []);
+  const required = [];
+  if (/\bctx\.storage\s*\./.test(src)) required.push(['storage', 'ctx.storage']);
+  if (/\bctx\.ui\.registerSettingsSection\b|\bctx\.ui\.openSettings\b/.test(src))
+    required.push(['ui:settings-section', 'settings section']);
+  if (/\bctx\.ui\.registerCommand\b/.test(src)) required.push(['ui:command', 'registerCommand']);
+  if (/plugin_exec_run[\s\S]{0,300}?bin\s*:\s*['"]powershell['"]/.test(src))
+    required.push(['exec:powershell', 'plugin_exec_run powershell']);
+  for (const [perm, usage] of required) {
+    if (!declared.has(perm)) fail(`源码用到 ${usage}，但 manifest.permissions 缺少 ${perm}`);
+  }
 }
 
 // 展示素材：必须存在、扩展名合法、不逃逸仓库

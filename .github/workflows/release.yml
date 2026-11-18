@@ -46,4 +46,5 @@ jobs:
           files: |
             main.js
             manifest.json
+            docs/icon.png
             checksums.txt
