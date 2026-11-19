@@ -293,6 +293,34 @@ function shortHash(h) {
   return h.slice(0, 12) + '…';
 }
 
+// 加载与过渡动画：颜色全部走宿主 token，深浅色主题自动跟随
+const UI_CSS = `
+@keyframes cli-audit-spin { to { transform: rotate(360deg); } }
+@keyframes cli-audit-pulse { 0%, 100% { opacity: .55; } 50% { opacity: .18; } }
+@keyframes cli-audit-fade { from { opacity: 0; transform: translateY(2px); } to { opacity: 1; transform: none; } }
+.cli-audit-spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  flex: none;
+  border: 2px solid var(--color-separator-border, rgba(127,127,127,.3));
+  border-top-color: var(--color-accent-primary-default, #3b82f6);
+  border-radius: 50%;
+  animation: cli-audit-spin .8s linear infinite;
+}
+.cli-audit-skeleton {
+  height: 10px;
+  border-radius: 5px;
+  background: var(--color-background-tertiary-hover, rgba(127,127,127,.15));
+  animation: cli-audit-pulse 1.2s ease-in-out infinite;
+}
+.cli-audit-fade { animation: cli-audit-fade 180ms ease-out; }
+.cli-audit-menu { animation: cli-audit-fade 120ms ease-out; }
+@media (prefers-reduced-motion: reduce) {
+  .cli-audit-spinner, .cli-audit-skeleton, .cli-audit-fade, .cli-audit-menu { animation: none; }
+}
+`;
+
 export default function activate(ctx) {
   const { createElement: h, useState, useEffect, useCallback } = ctx.react;
 
@@ -460,6 +488,7 @@ export default function activate(ctx) {
     const [hoverId, setHoverId] = useState(null);
     const [focusIdx, setFocusIdx] = useState(0);
     const [batch, setBatch] = useState(null);
+    const [hoverBtn, setHoverBtn] = useState(null);
 
     const runDiscover = useCallback(async () => {
       setDiscoverPhase('running');
@@ -567,7 +596,7 @@ export default function activate(ctx) {
         cursor: 'pointer',
         fontSize: 12,
         lineHeight: 1,
-        transition: 'background 120ms ease',
+        transition: 'background 120ms ease, opacity 120ms ease',
       },
       trigger: {
         display: 'flex',
@@ -646,7 +675,7 @@ export default function activate(ctx) {
         cursor: 'pointer',
         fontSize: 12,
         fontWeight: 500,
-        transition: 'opacity 120ms ease',
+        transition: 'opacity 120ms ease, filter 120ms ease',
       },
     };
 
@@ -659,6 +688,17 @@ export default function activate(ctx) {
     const isRunning = runningId === selectedId;
     const hasResult = !!(detail && detail.engine);
     const batchRunning = batch !== null;
+    const discoverDisabled = discoverPhase === 'running' || batchRunning;
+    const batchDisabled = batchRunning || installedCount === 0 || discoverPhase === 'running';
+    const detailDisabled = isRunning || batchRunning;
+
+    const btnHover = (id, disabled) => ({
+      onMouseEnter: () => {
+        if (!disabled) setHoverBtn(id);
+      },
+      onMouseLeave: () => setHoverBtn((cur) => (cur === id ? null : cur)),
+    });
+    const hoverBg = (id, disabled) => (!disabled && hoverBtn === id ? t.hover : 'transparent');
 
     const menuOrder = [...installedList, ...missingList];
     const selectedIdx = Math.max(0, menuOrder.findIndex((e) => e.id === selectedId));
@@ -708,6 +748,7 @@ export default function activate(ctx) {
     const head = h(
       'div',
       { style: style.head },
+      h('style', null, UI_CSS),
       h('span', { style: { fontWeight: 600 } }, 'CLI 安装检测'),
       h(
         'button',
@@ -715,14 +756,20 @@ export default function activate(ctx) {
           style: {
             ...style.btn,
             marginLeft: 'auto',
-            background: discoverPhase === 'running' || batchRunning ? t.hover : 'transparent',
-            opacity: batchRunning ? 0.65 : 1,
-            cursor: batchRunning ? 'default' : 'pointer',
+            background: hoverBg('discover', discoverDisabled),
+            opacity: discoverDisabled ? 0.55 : 1,
+            cursor: discoverDisabled ? 'not-allowed' : 'pointer',
           },
-          disabled: discoverPhase === 'running' || batchRunning,
+          disabled: discoverDisabled,
+          ...btnHover('discover', discoverDisabled),
           onClick: () => void runDiscover(),
         },
-        discoverPhase === 'running' ? '扫描中…' : '重新发现',
+        h(
+          'span',
+          { style: { display: 'inline-flex', alignItems: 'center', gap: 6 } },
+          discoverPhase === 'running' && h('span', { className: 'cli-audit-spinner' }),
+          discoverPhase === 'running' ? '扫描中…' : '重新发现',
+        ),
       ),
     );
 
@@ -740,8 +787,20 @@ export default function activate(ctx) {
         hint,
         h(
           'div',
-          { style: style.meta },
-          discoverPhase === 'idle' ? '正在读取上次结果…' : '正在扫描 PATH…',
+          { className: 'cli-audit-fade', style: style.card },
+          h(
+            'div',
+            { style: { ...style.row, marginBottom: 10 } },
+            h('span', { className: 'cli-audit-spinner' }),
+            h(
+              'span',
+              { style: style.meta },
+              discoverPhase === 'idle' ? '正在读取上次结果…' : '正在扫描 PATH…',
+            ),
+          ),
+          h('div', { className: 'cli-audit-skeleton', style: { width: '38%', marginBottom: 7 } }),
+          h('div', { className: 'cli-audit-skeleton', style: { width: '64%', marginBottom: 7 } }),
+          h('div', { className: 'cli-audit-skeleton', style: { width: '52%' } }),
         ),
       );
     }
@@ -871,10 +930,13 @@ export default function activate(ctx) {
             'aria-controls': open ? 'cli-audit-engine-menu' : undefined,
             style: {
               ...style.trigger,
-              opacity: batchRunning ? 0.65 : 1,
-              cursor: batchRunning ? 'default' : 'pointer',
+              background:
+                open || (!batchRunning && hoverBtn === 'trigger') ? t.hover : 'transparent',
+              opacity: batchRunning ? 0.55 : 1,
+              cursor: batchRunning ? 'not-allowed' : 'pointer',
             },
             disabled: batchRunning,
+            ...btnHover('trigger', batchRunning),
             onFocus: () => setPickerFocused(true),
             onBlur: () => setPickerFocused(false),
             onClick: () => {
@@ -903,6 +965,7 @@ export default function activate(ctx) {
             'div',
             {
               id: 'cli-audit-engine-menu',
+              className: 'cli-audit-menu',
               style: style.menu,
               role: 'listbox',
               'data-role': 'engine-menu',
@@ -921,26 +984,40 @@ export default function activate(ctx) {
           style: {
             ...style.btn,
             marginLeft: 'auto',
-            opacity: batchRunning || installedCount === 0 ? 0.65 : 1,
-            cursor: batchRunning || installedCount === 0 ? 'default' : 'pointer',
+            background: hoverBg('batch', batchDisabled),
+            opacity: batchDisabled ? 0.55 : 1,
+            cursor: batchDisabled ? 'not-allowed' : 'pointer',
           },
-          disabled: batchRunning || installedCount === 0 || discoverPhase === 'running',
+          disabled: batchDisabled,
+          ...btnHover('batch', batchDisabled),
           onClick: () => void runAll(),
         },
-        batchRunning ? '检测中 ' + batch.done + '/' + batch.total : '全部检测',
+        h(
+          'span',
+          { style: { display: 'inline-flex', alignItems: 'center', gap: 6 } },
+          batchRunning && h('span', { className: 'cli-audit-spinner' }),
+          batchRunning ? '检测中 ' + batch.done + '/' + batch.total : '全部检测',
+        ),
       ),
       h(
         'button',
         {
           style: {
             ...style.btnPrimary,
-            opacity: isRunning || batchRunning ? 0.65 : 1,
-            cursor: isRunning || batchRunning ? 'default' : 'pointer',
+            opacity: detailDisabled ? 0.55 : 1,
+            cursor: detailDisabled ? 'not-allowed' : 'pointer',
+            filter: !detailDisabled && hoverBtn === 'detail' ? 'brightness(0.94)' : 'none',
           },
-          disabled: isRunning || batchRunning,
+          disabled: detailDisabled,
+          ...btnHover('detail', detailDisabled),
           onClick: () => void runDetail(selectedId, hasResult),
         },
-        isRunning ? '检测中…' : hasResult ? '重新检测' : '检测',
+        h(
+          'span',
+          { style: { display: 'inline-flex', alignItems: 'center', gap: 6 } },
+          isRunning && !batchRunning && h('span', { className: 'cli-audit-spinner' }),
+          isRunning && !batchRunning ? '检测中…' : hasResult ? '重新检测' : '检测',
+        ),
       ),
       // 点击任意空白处收起下拉
       open &&
@@ -957,13 +1034,21 @@ export default function activate(ctx) {
     } else if (isRunning && !detail) {
       body = h(
         'div',
-        { style: style.card },
-        h('div', { style: style.meta }, '正在读取 ' + selected.label + ' 的版本与文件哈希…'),
+        { key: 'detail-loading', className: 'cli-audit-fade', style: style.card },
+        h(
+          'div',
+          { style: { ...style.row, marginBottom: 10 } },
+          h('span', { className: 'cli-audit-spinner' }),
+          h('span', { style: style.meta }, '正在读取 ' + selected.label + ' 的版本与文件哈希…'),
+        ),
+        h('div', { className: 'cli-audit-skeleton', style: { width: '42%', marginBottom: 7 } }),
+        h('div', { className: 'cli-audit-skeleton', style: { width: '68%', marginBottom: 7 } }),
+        h('div', { className: 'cli-audit-skeleton', style: { width: '55%' } }),
       );
     } else if (detail && detail.error) {
       body = h(
         'div',
-        { style: style.card },
+        { key: 'detail-error', className: 'cli-audit-fade', style: style.card },
         h(
           'div',
           { style: style.row },
@@ -978,7 +1063,11 @@ export default function activate(ctx) {
 
       body = h(
         'div',
-        { style: style.card },
+        {
+          key: 'detail-' + selectedId + '-' + (detail.at ? detail.at.getTime() : 'na'),
+          className: 'cli-audit-fade',
+          style: style.card,
+        },
         h(
           'div',
           { style: style.row },
@@ -1039,7 +1128,7 @@ export default function activate(ctx) {
     } else {
       body = h(
         'div',
-        { style: style.card },
+        { key: 'detail-empty-' + selectedId, className: 'cli-audit-fade', style: style.card },
         h(
           'div',
           { style: style.meta },
