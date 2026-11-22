@@ -10,121 +10,31 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /* ------------------------------------------------------------ React 替身 */
 
-const states = new Map();
-let stateIdx = 0;
-let refIdx = 0;
-// refs 槽位键是字符串，清空必须换新数组；这里没有 useRef，但保持一致。
-let refs = [];
-let effects = [];
-// hook 槽位按组件实例分域：反馈区是嵌套组件，不能和设置面板共用序号。
-let domain = 'root';
-let domainSeq = new Map();
+// 替身本体在 scripts/fake-react.mjs（四插件共用，工作志那份是基准）。
+// 这里保留 `renderFresh` 返回 { tree, effects } 的旧形状，调用点不用改。
+import { createFakeReact, walk, textOf, byClass, findAll } from './fake-react.mjs';
 
-const fakeReact = {
-  createElement: (type, props, ...children) => ({ type, props, children }),
-  useState: (init) => {
-    const i = domain + '|' + stateIdx++;
-    if (!states.has(i)) states.set(i, typeof init === 'function' ? init() : init);
-    return [
-      states.get(i),
-      (v) => states.set(i, typeof v === 'function' ? v(states.get(i)) : v),
-    ];
-  },
-  useEffect: (fn) => {
-    effects.push(fn);
-  },
-  useRef: (init) => {
-    const i = domain + '|' + refIdx++;
-    if (!refs[i]) refs[i] = { current: init === undefined ? null : init };
-    return refs[i];
-  },
-  useCallback: (fn) => fn,
-  useMemo: (fn) => fn(),
+const find = (tree, pred) => findAll(tree, pred)[0] || null;
+
+const fake = createFakeReact({ componentName: 'anon' });
+const fakeReact = fake.api;
+
+// 反馈区的额度查询在 effect 里，由用例手动跑。
+let collectedEffects = [];
+const baseUseEffect = fakeReact.useEffect;
+fakeReact.useEffect = (fn, deps) => {
+  collectedEffects.push({ fn, deps });
+  baseUseEffect(fn, deps);
 };
 
-// React 会调用函数组件；替身也要展开，否则拿到的只是 { type: Comp } 外壳。
-function expand(node) {
-  if (Array.isArray(node)) return node.map(expand);
-  if (!node || typeof node !== 'object') return node;
-  if (typeof node.type === 'function') {
-    const nm = node.type.name || 'anon';
-    const inst = domainSeq.get(nm) || 0;
-    domainSeq.set(nm, inst + 1);
-    const prev = { domain, stateIdx, refIdx };
-    domain = nm + '#' + inst;
-    stateIdx = 0;
-    refIdx = 0;
-    const props = Object.assign({}, node.props || {}, { children: node.children || [] });
-    const out = node.type(props);
-    domain = prev.domain;
-    stateIdx = prev.stateIdx;
-    refIdx = prev.refIdx;
-    return expand(out);
-  }
-  return Object.assign({}, node, { children: (node.children || []).map(expand) });
-}
-
-function renderFreshState(comp, props) {
-  states.clear();
-  refs = [];
-  stateIdx = 0;
-  refIdx = 0;
-  domain = 'root';
-  domainSeq = new Map();
-  effects = [];
-  return expand(comp(props || {}));
-}
-
 function renderFresh(comp, props) {
-  return { tree: renderFreshState(comp, props), effects };
+  collectedEffects = [];
+  const tree = fake.renderFresh(comp, props);
+  return { tree, effects: collectedEffects.map((e) => e.fn) };
 }
 
-// 保留组件内部状态的重渲染：用于验证「输入 → 点按钮 → 读结果」这类交互。
 function renderKeep(comp, props) {
-  let tree = null;
-  for (let pass = 0; pass < 5; pass += 1) {
-    const before = new Map(states);
-    stateIdx = 0;
-    refIdx = 0;
-    domain = 'root';
-    domainSeq = new Map();
-    effects = [];
-    tree = expand(comp(props || {}));
-    let changed = before.size !== states.size;
-    for (const [k, v] of states) {
-      if (!changed && before.get(k) !== v) changed = true;
-    }
-    if (!changed) break;
-  }
-  return tree;
-}
-
-function walk(node, fn) {
-  if (Array.isArray(node)) {
-    for (const n of node) walk(n, fn);
-    return;
-  }
-  if (!node || typeof node !== 'object') return;
-  fn(node);
-  for (const c of node.children || []) walk(c, fn);
-}
-
-function textOf(node) {
-  if (typeof node === 'string') return node;
-  if (typeof node === 'number') return String(node);
-  if (Array.isArray(node)) return node.map(textOf).join('');
-  if (!node || typeof node !== 'object') return '';
-  return (node.children || []).map(textOf).join('');
-}
-
-function byClass(tree, cls) {
-  let hit = null;
-  walk(tree, (n) => {
-    if (hit) return;
-    const c = n.props && n.props.className;
-    if (typeof c === 'string' && c.split(/\s+/).includes(cls)) hit = n;
-  });
-  return hit;
+  return fake.renderKeep(comp, props);
 }
 
 function findLink(tree, text) {
