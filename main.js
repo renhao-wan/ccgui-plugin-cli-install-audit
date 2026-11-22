@@ -324,7 +324,327 @@ const UI_CSS = `
 export default function activate(ctx) {
   const { createElement: h, useState, useEffect, useCallback } = ctx.react;
 
+  const PLUGIN_ID = 'cli-install-audit';
+  const PLUGIN_NAME = 'CLI 安装检测';
   const CACHE_KEY = 'audit-cache-v1';
+  // 反馈中转。改主机名要同步 manifest.json 的 network:<host>（精确匹配，不支持通配）。
+  const FEEDBACK_ENDPOINT = 'https://ccgui-feedback.2653990378.workers.dev';
+  const FEEDBACK_REPO = 'renhao-wan/ccgui-plugin-cli-install-audit';
+  const FEEDBACK_TIMEOUT_MS = 15000;
+
+  /* ------------------------------------------------------------ 反馈纯函数
+   * 从 ccgui-plugin-github-trending 的 src/lib/feedback.mjs 原样复制（这个插件
+   * 没有构建步骤，只能整段内联）。改这里记得同步那边，两边应当逐字一致。
+   * 只回答「发什么」和「回什么」，网络在下方 sendFeedback / fetchQuota 里。
+   */
+
+  /** 正文上限。再长就不是一条反馈，而是一篇文档了。 */
+  const TEXT_LIMIT = 1000;
+
+  /**
+   * 收敛用户输入：去控制字符、统一换行、折叠连续空行与行尾空白、限长。
+   * 保留大小写、中文、emoji 与**换行**——用户最常贴的就是报错日志，
+   * 压成一行后堆栈就没法看了。
+   */
+  function normaliseFeedbackText(raw) {
+    return String(raw === undefined || raw === null ? '' : raw)
+      .replace(/\r\n?/g, '\n')
+      .replace(/\t/g, ' ')
+      .replace(/[\u0000-\u0009\u000b-\u001f\u007f�]/g, '')
+      // 只去行尾空白与整段首尾空白；正文内行首缩进要留着（堆栈靠它对齐）。
+      .replace(/[ \t]+$/gm, '')
+      .replace(/^[ \t]+/, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .replace(/^\n+|\n+$/g, '')
+      .slice(0, TEXT_LIMIT)
+      .replace(/[ \t\n]+$/, '');
+  }
+
+  /**
+   * GitHub 新建 Issue 的预填链接。
+   *
+   * 用预填而不是直接调 API：API 要 PAT，PAT 写进插件源码等于公开。预填链接
+   * 只依赖用户浏览器里已有的登录态，插件一行网络代码都不用写。
+   */
+  function buildIssueUrl(o) {
+    const text = normaliseFeedbackText(o.text);
+    const body = [
+      text || '_（请在这里描述问题或建议）_',
+      '',
+      '---',
+      '插件：' + String(o.pluginName || '') + ' ' + String(o.pluginVersion || ''),
+      'CC GUI：' + String(o.hostVersion || ''),
+    ].join('\n');
+    const q = new URLSearchParams({
+      title: '[反馈] ' + String(o.pluginName || ''),
+      body,
+    });
+    return 'https://github.com/' + String(o.repo || '') + '/issues/new?' + q.toString();
+  }
+
+  /** 请求体允许的字段。白名单而非黑名单：漏传字段比误传路径好。 */
+  const PAYLOAD_FIELDS = ['text', 'pluginId', 'pluginVersion', 'hostVersion', 'ts'];
+
+  /** 组装发往中转的请求体，只保留白名单字段。 */
+  function buildFeedbackPayload(o) {
+    const src = {
+      text: normaliseFeedbackText(o.text),
+      pluginId: String(o.pluginId || ''),
+      pluginVersion: String(o.pluginVersion || ''),
+      hostVersion: String(o.hostVersion || ''),
+      ts: Number(o.now) || Date.now(),
+    };
+    const out = {};
+    for (const k of PAYLOAD_FIELDS) out[k] = src[k];
+    return out;
+  }
+
+  /** 把服务端给的额度字段收敛成 number | null。别用 Number.isFinite(Number(v))：
+   *  Number(null) 与 Number('') 都是 0，会把「没给」读成「今天 0 条额度」。 */
+  function quotaCount(v) {
+    if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+    if (typeof v === 'string') {
+      if (!v.trim()) return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    }
+    return null;
+  }
+
+  /** 发送成功后更新剩余额度：服务端回传的优先，没给就按旧值自减一条。 */
+  function nextQuota(prev, fromServer) {
+    const n = quotaCount(fromServer);
+    if (n !== null) {
+      return { remaining: n, dailyLimit: (prev && prev.dailyLimit) || 30 };
+    }
+    const prevRemaining = prev && typeof prev.remaining === 'number' ? prev.remaining : null;
+    if (prevRemaining === null) return prev;
+    return { remaining: Math.max(0, prevRemaining - 1), dailyLimit: prev.dailyLimit || 30 };
+  }
+
+  function parseJsonBody(body) {
+    if (typeof body !== 'string' || !body) return null;
+    try {
+      const v = JSON.parse(body);
+      return v && typeof v === 'object' ? v : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 把一次中转响应翻译成界面文案。
+   *
+   * 一条原则：**永远给出「你还能做什么」**。反馈发不出去不是用户的错，
+   * 所以每条失败文案都要么说清原因，要么指向还能走的路（GitHub Issue）。
+   */
+  function describeFeedbackResult(r) {
+    if (r && r.error) {
+      const raw = String(r.error.message || r.error);
+      if (/timed?\s*out|timeout|ETIMEDOUT/i.test(raw)) {
+        return {
+          ok: false,
+          kind: 'timeout',
+          message: '发送超时。中转可能被网络挡住，可改用 GitHub Issue 反馈',
+          remaining: null,
+        };
+      }
+      if (/network:|permission|授权/i.test(raw)) {
+        return { ok: false, kind: 'denied', message: '网络权限未生效，请重新安装插件', remaining: null };
+      }
+      return {
+        ok: false,
+        kind: 'network',
+        message: '连不上反馈服务，请检查网络或代理，也可改用 GitHub Issue 反馈',
+        remaining: null,
+      };
+    }
+
+    const status = Number(r && r.status) || 0;
+    const data = parseJsonBody(r && r.body);
+    const remaining = data ? quotaCount(data.remaining) : null;
+    const code = data && typeof data.error === 'string' ? data.error : '';
+
+    if (status >= 200 && status < 300) {
+      // 成功响应必须带 ok:true。只看状态码会把运营商劫持页、登录门户、
+      // 代理错误页（都会返回 200）当成「已发送」——用户以为发出去了，
+      // 实际什么都没有。
+      if (!data || data.ok !== true) {
+        return {
+          ok: false,
+          kind: 'garbled',
+          message: '反馈服务返回了无法识别的内容，可能被网络拦截，可改用 GitHub Issue 反馈',
+          remaining: null,
+        };
+      }
+      return { ok: true, kind: 'sent', message: '反馈已发送，谢谢', remaining };
+    }
+
+    if (status === 429) {
+      const burst = data && data.kind === 'burst';
+      return {
+        ok: false,
+        kind: 'rate_limited',
+        message: burst
+          ? '发得太快了，稍等几分钟再试，或改用 GitHub Issue 反馈'
+          : '今天的反馈额度已用完，明天再来，或改用 GitHub Issue 反馈',
+        // burst 时今天还有额度，写死 0 会让界面谎报「今天用完了」。
+        remaining: burst ? remaining : 0,
+      };
+    }
+
+    if (status === 413) {
+      return { ok: false, kind: 'invalid', message: '反馈内容太长了，请缩短后重试', remaining };
+    }
+
+    if (status === 400) {
+      if (code === 'unknown_plugin') {
+        return {
+          ok: false,
+          kind: 'invalid',
+          message: '中转不认识这个插件版本，请更新插件，或改用 GitHub Issue 反馈',
+          remaining,
+        };
+      }
+      if (code === 'empty_text') {
+        return { ok: false, kind: 'invalid', message: '反馈内容是空的，写点内容再发', remaining };
+      }
+      return { ok: false, kind: 'invalid', message: '反馈内容不合要求，请缩短后重试', remaining };
+    }
+
+    if (status === 502 || status === 503 || status === 500) {
+      return {
+        ok: false,
+        kind: 'http',
+        message: '中转暂时不可用，稍后再试，或改用 GitHub Issue 反馈',
+        remaining,
+      };
+    }
+
+    if (status === 0) {
+      return {
+        ok: false,
+        kind: 'network',
+        message: '连不上反馈服务，请检查网络或代理，也可改用 GitHub Issue 反馈',
+        remaining: null,
+      };
+    }
+
+    return {
+      ok: false,
+      kind: 'http',
+      message: '发送失败（HTTP ' + status + '），可改用 GitHub Issue 反馈',
+      remaining,
+    };
+  }
+
+  /**
+   * 额度提示文案。两种「查不到」要分开：
+   *   - `{offline: true}`：请求失败。说「额度有限」会把网络故障说成用户在刷屏。
+   *   - 其他：服务端回了但字段脏，或压根没查。这时该提醒别刷屏。
+   */
+  function describeQuota(quota) {
+    if (quota && quota.offline) {
+      return { remaining: null, message: '暂时连不上反馈服务，发送时再试', canRetry: true };
+    }
+    // Number(null) === 0、Number('') === 0：不显式挡掉，脏数据会被读成「0 条」。
+    const raw = quota ? quota.remaining : undefined;
+    if (typeof raw !== 'number' || !Number.isFinite(raw)) {
+      return { remaining: null, message: '额度有限，请勿刷屏', canRetry: true };
+    }
+    const remaining = Math.max(0, raw);
+    if (remaining === 0) {
+      return { remaining: 0, message: '今天的反馈额度已用完，明天再来', canRetry: true };
+    }
+    return { remaining, message: '今天还可发 ' + remaining + ' 条反馈', canRetry: false };
+  }
+
+  /** 给桥接调用加一层超时。宿主侧若一直挂着，界面不能永远停在「发送中…」。 */
+  function withTimeout(promise, ms, label) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(label + ' timeout')), ms);
+      promise.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
+  }
+
+  /** 宿主版本。老版本宿主可能没有这一项，取不到就留空，不能因此发不出反馈。 */
+  function hostAppVersion() {
+    try {
+      return ctx && ctx.host && typeof ctx.host.appVersion === 'string' ? ctx.host.appVersion : '';
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * 发一条反馈到中转。返回 describeFeedbackResult 的归一化结果。
+   *
+   * 不做连接层重试：反馈是 POST，重试会把同一条内容发两遍——
+   * 用户看到「发送失败」再点一次，比静默重复更可控。
+   */
+  async function sendFeedback(text) {
+    const payload = buildFeedbackPayload({
+      text,
+      pluginId: PLUGIN_ID,
+      pluginVersion: ctx.version,
+      hostVersion: hostAppVersion(),
+    });
+    try {
+      const res = await withTimeout(
+        ctx.bridge.invoke('plugin_http_request', {
+          method: 'POST',
+          url: FEEDBACK_ENDPOINT + '/feedback',
+          headers: {
+            'Content-Type': 'application/json',
+            'User-Agent': 'ccgui-cli-install-audit/' + ctx.version,
+          },
+          body: JSON.stringify(payload),
+        }),
+        FEEDBACK_TIMEOUT_MS,
+        'feedback',
+      );
+      return describeFeedbackResult({ status: Number(res && res.status) || 0, body: res && res.body });
+    } catch (error) {
+      return describeFeedbackResult({ error });
+    }
+  }
+
+  /**
+   * 查今天的剩余额度。失败时返回 `{offline: true}`——额度查不到不能挡住发反馈，
+   * 但要让界面知道「是连不上」而不是「额度紧张」。
+   */
+  async function fetchQuota() {
+    try {
+      const res = await withTimeout(
+        ctx.bridge.invoke('plugin_http_request', {
+          method: 'GET',
+          url: FEEDBACK_ENDPOINT + '/quota',
+          headers: { 'User-Agent': 'ccgui-cli-install-audit/' + ctx.version },
+          body: null,
+        }),
+        FEEDBACK_TIMEOUT_MS,
+        'quota',
+      );
+      const status = Number(res && res.status) || 0;
+      if (!(status >= 200 && status < 300)) return { offline: true };
+      const body = res && typeof res.body === 'string' ? res.body : '';
+      const data = body ? JSON.parse(body) : null;
+      // 用 quotaCount 而不是 Number.isFinite(Number(...))：后者把 null/'' 读成 0。
+      const remaining = data ? quotaCount(data.remaining) : null;
+      return remaining === null ? null : { remaining, dailyLimit: Number(data.dailyLimit) || 30 };
+    } catch {
+      return { offline: true };
+    }
+  }
 
   // 会话内缓存：引擎列表 + 每个引擎的详情，设置页重挂载或切换回来都不重扫
   const cache = { engines: null, details: {}, savedAt: null };
@@ -473,6 +793,240 @@ export default function activate(ctx) {
       .sort((a, b) => OWNER_ORDER.indexOf(a) - OWNER_ORDER.indexOf(b))
       .map((o) => OWNER[o] || o)
       .join(' + ');
+  }
+
+  function FeedbackPanel() {
+    // 这个插件整套 UI 用内联 style（没有 CSS 文件），反馈区沿用同样的做法。
+    const t = {
+      border: 'var(--color-separator-border, rgba(127,127,127,0.3))',
+      cardBg: 'var(--color-background-secondary-default, rgba(127,127,127,0.06))',
+      text: 'var(--color-text-primary, inherit)',
+      text3: 'var(--color-text-tertiary, inherit)',
+      accent: 'var(--color-accent-primary-default, #3b82f6)',
+      ok: 'var(--color-text-success, #2e7d32)',
+      bad: 'var(--color-text-danger, #c4242a)',
+    };
+
+    // 反馈区是局部状态；这个插件的顶层解构已有 useState/useEffect，直接用。
+    const [text, setText] = useState('');
+    // '' -> 'sending' -> 'sent'/'error'
+    const [sendStatus, setSendStatus] = useState('');
+    const [result, setResult] = useState(null);
+    const [quota, setQuota] = useState(null);
+    // 「只在挂载时查一次额度」的同步标志。用 useRef 而不是 useState：
+    // 这个标志只在 effect 里读写，不该触发重渲染。
+    const quotaTried = ctx.react.useRef(false);
+    // 同步的在途标志。canSend 是渲染时的闭包值，同一 tick 内两次触发都会
+    // 读到旧的 sendStatus=''，只在状态里防不住双击。
+    const sendingRef = ctx.react.useRef(false);
+
+    async function loadQuota() {
+      const q = await fetchQuota();
+      setQuota(q);
+      return q;
+    }
+
+    useEffect(() => {
+      if (quotaTried.current) return;
+      quotaTried.current = true;
+      void loadQuota();
+      // 只在挂载时查一次；之后由「重试」按钮或发送结果更新。
+    }, []);
+
+    const trimmed = normaliseFeedbackText(text);
+    const canSend = trimmed.length > 0 && sendStatus !== 'sending';
+
+    const issueUrl = buildIssueUrl({
+      repo: FEEDBACK_REPO,
+      pluginName: PLUGIN_NAME,
+      text: trimmed,
+      pluginVersion: ctx.version,
+      hostVersion: hostAppVersion(),
+    });
+
+    async function submit() {
+      if (!canSend || sendingRef.current) return;
+      sendingRef.current = true;
+      const submitted = trimmed;
+      setSendStatus('sending');
+      setResult(null);
+
+      let r;
+      try {
+        r = await sendFeedback(submitted);
+      } finally {
+        sendingRef.current = false;
+      }
+
+      setSendStatus(r.ok ? 'sent' : 'error');
+      setResult(r);
+      if (!r.ok) return;
+
+      // 只清掉「这次发出去的那段」：发送期间用户可能又敲了内容。
+      setText((cur) => (cur === submitted ? '' : cur));
+
+      // 额度优先用服务端回传的真实值，顺便把「暂时连不上」纠正过来。
+      // 没有回传额度就按旧值自减一条，别把它读成 0 条。
+      setQuota((prev) => nextQuota(prev, r.remaining));
+    }
+
+    const quotaText = describeQuota(quota);
+    const statusText = sendStatus === 'sending' ? '发送中…' : result ? result.message : '';
+    // 成功时正文被清空，按钮会变成不可点的死按钮。若文案还停在「发送反馈」，
+    // 用户看到的就是「点了没反应」——回执必须落在按钮自己身上。
+    const sendLabel = sendStatus === 'sending' ? '发送中…' : sendStatus === 'sent' ? '已发送' : '发送反馈';
+
+    const btnStyle = {
+      height: 30,
+      padding: '0 10px',
+      borderRadius: 7,
+      border: '1px solid ' + (sendStatus === 'sent' ? t.ok : t.border),
+      background: 'transparent',
+      color: sendStatus === 'sent' ? t.ok : 'inherit',
+      cursor: canSend ? 'pointer' : 'not-allowed',
+      fontSize: 12,
+      lineHeight: 1,
+      // :disabled 的透明度会把它糊成灰色，成功态要压回 1
+      opacity: sendStatus === 'sent' ? 1 : canSend ? 1 : 0.45,
+    };
+
+    return h(
+      'div',
+      { style: { marginTop: 14, color: t.text } },
+      h('div', { style: { fontSize: 13, fontWeight: 600, marginBottom: 4 } }, '反馈'),
+      h(
+        'div',
+        { style: { color: t.text3, fontSize: 12, marginBottom: 8 } },
+        '遇到问题或想提建议，两种方式任选其一。发送的内容只有这段文字、插件版本与 CC GUI 版本，不含会话、代码或本机路径。',
+      ),
+      h('textarea', {
+        className: 'cli-audit-feedback-text',
+        value: text,
+        rows: 4,
+        maxLength: TEXT_LIMIT,
+        placeholder: '描述问题或建议…（最多 ' + TEXT_LIMIT + ' 字）',
+        spellCheck: false,
+        'aria-label': '反馈正文',
+        style: {
+          width: '100%',
+          minHeight: 84,
+          boxSizing: 'border-box',
+          resize: 'vertical',
+          padding: '8px 10px',
+          border: '1px solid ' + t.border,
+          borderRadius: 7,
+          background: 'transparent',
+          color: 'inherit',
+          font: 'inherit',
+          fontSize: 12,
+          lineHeight: 1.6,
+        },
+        onChange: (e) => {
+          setText(e.target.value);
+          // 重新输入等于开了一条新反馈：上一条的回执都该撤掉。
+          if (sendStatus !== 'sending') {
+            setSendStatus('');
+            setResult(null);
+          }
+        },
+      }),
+      h(
+        'div',
+        { style: { display: 'flex', justifyContent: 'space-between', gap: 10, marginTop: 4 } },
+        h(
+          'span',
+          { className: 'cli-audit-feedback-count', style: { color: t.text3, fontSize: 12 } },
+          text.length + ' / ' + TEXT_LIMIT,
+        ),
+        h(
+          'span',
+          { className: 'cli-audit-feedback-quota', style: { color: t.text3, fontSize: 12, textAlign: 'right' } },
+          quotaText.message,
+          // 额度查不到 / 用完了都给一条重试路径，否则用户只能重开设置页。
+          quotaText.canRetry
+            ? h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'cli-audit-feedback-quota-retry',
+                  disabled: sendStatus === 'sending',
+                  onClick: () => void loadQuota(),
+                  style: {
+                    marginLeft: 6,
+                    padding: 0,
+                    border: 0,
+                    background: 'none',
+                    font: 'inherit',
+                    fontSize: 12,
+                    color: t.accent,
+                    textDecoration: 'underline',
+                    cursor: 'pointer',
+                  },
+                },
+                '重试',
+              )
+            : null,
+        ),
+      ),
+      h(
+        'div',
+        { style: { display: 'flex', alignItems: 'center', gap: 8, marginTop: 10, flexWrap: 'wrap' } },
+        h(
+          'a',
+          {
+            className: 'cli-audit-feedback-issue',
+            href: issueUrl,
+            target: '_blank',
+            rel: 'noreferrer noopener',
+            title: '在浏览器里打开预填好的 Issue 页面',
+            style: {
+              display: 'inline-flex',
+              alignItems: 'center',
+              height: 30,
+              boxSizing: 'border-box',
+              padding: '0 10px',
+              borderRadius: 7,
+              border: '1px solid ' + t.border,
+              color: 'inherit',
+              fontSize: 12,
+              lineHeight: 1,
+              textDecoration: 'none',
+            },
+          },
+          '通过 GitHub 提 Issue',
+        ),
+        h(
+          'button',
+          {
+            type: 'button',
+            className:
+              'cli-audit-feedback-send' + (sendStatus === 'sent' ? ' cli-audit-feedback-sent' : ''),
+            disabled: !canSend,
+            onClick: () => void submit(),
+            style: btnStyle,
+          },
+          sendLabel,
+        ),
+      ),
+      statusText
+        ? h(
+            'div',
+            {
+              className: 'cli-audit-feedback-status',
+              role: 'status',
+              'aria-live': 'polite',
+              style: {
+                marginTop: 8,
+                fontSize: 12,
+                lineHeight: 1.6,
+                color: sendStatus === 'sent' ? t.ok : sendStatus === 'error' ? t.bad : t.text3,
+                fontWeight: sendStatus === 'sent' ? 500 : 400,
+              },
+            },
+            statusText,
+          )
+        : null,
+    );
   }
 
   function SettingsPanel() {
@@ -779,6 +1333,10 @@ export default function activate(ctx) {
       '先只检查命令是否存在，选中引擎后才读取版本、SHA256 与运行中进程。',
     );
 
+    // 早期 return 的分支（扫描中 / 扫描失败 / 空闲骨架）也要带上反馈区：
+    // 「扫描失败」恰恰是最需要用户反馈的场景，不能因为提前 return 就把入口藏掉。
+    const feedback = h(FeedbackPanel, null);
+
     if ((discoverPhase === 'running' || discoverPhase === 'idle') && engines.length === 0) {
       return h(
         'div',
@@ -802,6 +1360,7 @@ export default function activate(ctx) {
           h('div', { className: 'cli-audit-skeleton', style: { width: '64%', marginBottom: 7 } }),
           h('div', { className: 'cli-audit-skeleton', style: { width: '52%' } }),
         ),
+        feedback,
       );
     }
 
@@ -821,6 +1380,7 @@ export default function activate(ctx) {
             h('span', null, '扫描失败：' + error),
           ),
         ),
+        feedback,
       );
     }
 
@@ -1164,21 +1724,44 @@ export default function activate(ctx) {
 
       picker,
       body,
+      feedback,
     );
   }
 
-  ctx.ui.registerSettingsSection({
-    key: 'diagnostics',
-    label: () => 'CLI 安装检测',
-    component: SettingsPanel,
-  });
+  // 宿主注册入口时会返回一个注销函数。收起来统一在卸载时调用，
+  // 否则插件被停用/重装后旧组件的注册还挂在宿主上。
+  const disposers = [];
+  const remember = (d) => {
+    if (typeof d === 'function') disposers.push(d);
+    return d;
+  };
 
-  ctx.ui.registerCommand({
-    key: 'cli-install-audit.open',
-    title: () => 'CLI 安装检测',
-    keywords: () => ['cli', 'install', 'audit', 'sha256', 'claude', 'codex', 'opencode', '安装', '版本'],
-    run: () => {
-      ctx.ui.openSettings('diagnostics');
-    },
-  });
+  remember(
+    ctx.ui.registerSettingsSection({
+      key: 'diagnostics',
+      label: () => 'CLI 安装检测',
+      component: SettingsPanel,
+    }),
+  );
+
+  remember(
+    ctx.ui.registerCommand({
+      key: 'cli-install-audit.open',
+      title: () => 'CLI 安装检测',
+      keywords: () => ['cli', 'install', 'audit', 'sha256', 'claude', 'codex', 'opencode', '安装', '版本'],
+      run: () => {
+        ctx.ui.openSettings('diagnostics');
+      },
+    }),
+  );
+
+  return () => {
+    for (const d of disposers) {
+      try {
+        d();
+      } catch {
+        // 卸载单个入口失败不影响其余清理
+      }
+    }
+  };
 }

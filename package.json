@@ -1,11 +1,14 @@
 {
   "name": "ccgui-plugin-cli-install-audit",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "CC GUI 插件：逐个探测多个 CLI 引擎的安装是否一致",
   "license": "MIT",
   "scripts": {
-    "validate": "node scripts/validate-manifest.mjs"
+    "validate": "node scripts/validate-manifest.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "sync": "node scripts/check-feedback-sync.mjs",
+    "check": "node scripts/check-feedback-sync.mjs && node scripts/validate-manifest.mjs && node scripts/smoke.mjs"
   }
 }

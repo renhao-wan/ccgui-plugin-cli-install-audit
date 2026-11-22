@@ -1,7 +1,7 @@
 {
   "id": "cli-install-audit",
   "name": "CLI 安装检测",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "sdkVersion": "^0.3",
   "minAppVersion": "1.0.4",
   "author": "renhao-wan",
@@ -11,5 +11,11 @@
   "license": "MIT",
   "keywords": ["cli", "install", "audit", "sha256", "version", "claude", "codex", "opencode"],
   "tier": "js",
-  "permissions": ["ui:settings-section", "ui:command", "exec:powershell", "storage"]
+  "permissions": [
+    "ui:settings-section",
+    "ui:command",
+    "exec:powershell",
+    "storage",
+    "network:ccgui-feedback.2653990378.workers.dev"
+  ]
 }
