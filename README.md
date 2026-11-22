@@ -182,10 +182,15 @@ CC GUI 侧边栏「插件」→ 在市场里搜索「CLI 安装检测」，或�
 ## 开发
 
 ```bash
-node scripts/check-feedback-sync.mjs  # 反馈纯函数与基准（github-trending/src/lib/feedback.mjs）逐字一致
+npm install                           # 共用层来自 ccgui-plugin-shared（npm 依赖）
+node scripts/build.mjs                # 把共用库内联进 src/main.head.js → main.js
 node scripts/validate-manifest.mjs
 node scripts/smoke.mjs               # 反馈区（其余部分需真机 PowerShell，见「已知限制」）
 ```
+
+`main.js` 是构建产物：反馈相关的纯函数、网络层与反馈区组件来自
+`ccgui-plugin-shared`，改逻辑请改那个包并升版本，不要直接改产物。改了源码
+忘了构建，CI 的 `git diff --exit-code main.js` 会拦住。
 
 自检同时校验 `manifest.permissions` 与 `main.js` 中实际用到的能力是否一致（例如 `ctx.storage` 必须有 `storage` 权限），避免运行期静默失败。
 

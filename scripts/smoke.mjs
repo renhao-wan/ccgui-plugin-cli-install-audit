@@ -10,9 +10,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /* ------------------------------------------------------------ React 替身 */
 
-// 替身本体在 scripts/fake-react.mjs（四插件共用，工作志那份是基准）。
+// 替身本体在 ccgui-plugin-shared/fake-react（四插件共用一份源码）。
 // 这里保留 `renderFresh` 返回 { tree, effects } 的旧形状，调用点不用改。
-import { createFakeReact, walk, textOf, byClass, findAll } from './fake-react.mjs';
+import { createFakeReact, walk, textOf, byClass, findAll } from 'ccgui-plugin-shared/fake-react';
 
 const find = (tree, pred) => findAll(tree, pred)[0] || null;
 

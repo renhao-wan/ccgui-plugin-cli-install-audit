@@ -6,9 +6,12 @@
   "description": "CC GUI 插件：逐个探测多个 CLI 引擎的安装是否一致",
   "license": "MIT",
   "scripts": {
+    "build": "node scripts/build.mjs",
     "validate": "node scripts/validate-manifest.mjs",
     "smoke": "node scripts/smoke.mjs",
-    "sync": "node scripts/check-feedback-sync.mjs",
-    "check": "node scripts/check-feedback-sync.mjs && node scripts/validate-manifest.mjs && node scripts/smoke.mjs"
+    "check": "npm run build && npm run validate && npm run smoke"
+  },
+  "dependencies": {
+    "ccgui-plugin-shared": "github:renhao-wan/ccgui-plugin-shared#v0.1.0"
   }
 }
