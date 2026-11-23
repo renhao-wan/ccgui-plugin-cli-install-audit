@@ -1,7 +1,7 @@
 {
   "id": "cli-install-audit",
   "name": "CLI 安装检测",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "sdkVersion": "^0.3",
   "minAppVersion": "1.0.4",
   "author": "renhao-wan",
@@ -9,7 +9,16 @@
   "repo": "renhao-wan/ccgui-plugin-cli-install-audit",
   "icon": "docs/icon.png",
   "license": "MIT",
-  "keywords": ["cli", "install", "audit", "sha256", "version", "claude", "codex", "opencode"],
+  "keywords": [
+    "cli",
+    "install",
+    "audit",
+    "sha256",
+    "version",
+    "claude",
+    "codex",
+    "opencode"
+  ],
   "tier": "js",
   "permissions": [
     "ui:settings-section",
