@@ -294,7 +294,7 @@ function shortHash(h) {
 }
 
 // 加载与过渡动画：颜色全部走宿主 token，深浅色主题自动跟随
-const UI_CSS = `
+const CSS = `
 @keyframes cli-audit-spin { to { transform: rotate(360deg); } }
 @keyframes cli-audit-pulse { 0%, 100% { opacity: .55; } 50% { opacity: .18; } }
 @keyframes cli-audit-fade { from { opacity: 0; transform: translateY(2px); } to { opacity: 1; transform: none; } }
@@ -316,6 +316,65 @@ const UI_CSS = `
 }
 .cli-audit-fade { animation: cli-audit-fade 180ms ease-out; }
 .cli-audit-menu { animation: cli-audit-fade 120ms ease-out; }
+
+/* ---------- 引擎下拉 ----------
+ * 结构与类名来自共用包 ccgui-plugin-shared/dropdown（cli-dd-*）。
+ * 本插件其余控件都是内联 style，但下拉没法这么做：库只产出类名，
+ * 样式必须落在 CSS 里。这一块是唯一的例外，颜色仍走宿主 token。 */
+@keyframes cli-audit-enter { from { opacity: 0; transform: translateY(-2px); } to { opacity: 1; transform: none; } }
+.cli-dd { position: relative; display: inline-flex; }
+.cli-dd-trigger {
+  display: flex; align-items: center; gap: 8px;
+  height: 30px; min-width: 200px; max-width: 280px;
+  padding: 0 10px; box-sizing: border-box;
+  border-radius: 7px; border: 1px solid var(--color-separator-border, rgba(127,127,127,.3));
+  background: transparent; color: inherit; font: inherit; font-size: 12px;
+  cursor: pointer; outline: none; text-align: left;
+  transition: border-color 120ms ease, background 120ms ease, opacity 120ms ease;
+}
+.cli-dd.is-open .cli-dd-trigger { border-color: var(--color-accent-primary-default, #3b82f6); }
+.cli-dd-trigger:disabled { opacity: .55; cursor: not-allowed; }
+.cli-dd-value { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cli-dd-value.is-empty { color: var(--color-text-tertiary, rgba(127,127,127,.8)); }
+.cli-dd-caret {
+  flex: none; width: 6px; height: 6px; margin-top: -3px;
+  border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor;
+  transform: rotate(45deg); opacity: .55; transition: transform 120ms ease, margin 120ms ease;
+}
+.cli-dd.is-open .cli-dd-caret { transform: rotate(-135deg); margin-top: 3px; }
+.cli-dd-scrim { position: fixed; inset: 0; z-index: 40; }
+/* 浮层底色必须自带兜底：宿主没给 --color-background-secondary-default 时
+ * 不能退回深色（浅色主题下会变成一块黑底）。这里显式给浅色兜底，深色由
+ * .dark 覆盖。 */
+.cli-dd-menu {
+  position: absolute; left: 0; top: calc(100% + 6px); z-index: 41;
+  min-width: 100%; width: max-content; max-width: 320px; max-height: 260px; overflow-y: auto;
+  box-sizing: border-box; padding: 4px;
+  background: var(--color-background-secondary-default, #ffffff);
+  color: var(--color-text-primary, inherit);
+  border: 1px solid var(--color-separator-border, rgba(127,127,127,.3));
+  border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.12);
+}
+.dark .cli-dd-menu, html.dark .cli-dd-menu {
+  background: var(--color-background-secondary-default, #242a35);
+  border-color: var(--color-separator-border, rgba(255,255,255,.14));
+  box-shadow: 0 8px 24px rgba(0,0,0,.45);
+}
+.cli-dd.is-up .cli-dd-menu { top: auto; bottom: calc(100% + 6px); }
+.cli-dd-group { padding: 6px 8px 2px; font-size: 11px; color: var(--color-text-tertiary, inherit); user-select: none; white-space: nowrap; }
+.cli-dd-item {
+  display: flex; align-items: center; gap: 8px; height: 28px; padding: 0 8px;
+  border-radius: 6px; font-size: 12px; cursor: pointer; outline: none; white-space: nowrap;
+}
+.cli-dd-item.is-active { background: var(--color-background-tertiary-hover, rgba(127,127,127,.15)); }
+.cli-dd-item.is-disabled { opacity: .45; cursor: default; }
+.cli-dd-item.is-disabled.is-active { background: transparent; }
+.cli-dd-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cli-dd-check { flex: none; width: 12px; font-size: 11px; color: var(--color-accent-primary-default, #3b82f6); opacity: 0; }
+.cli-dd-item[aria-selected="true"] .cli-dd-check { opacity: 1; }
+.cli-dd-item[aria-selected="true"] .cli-dd-label { font-weight: 500; }
+.cli-dd-empty { padding: 6px 8px; font-size: 12px; color: var(--color-text-tertiary, inherit); }
+
 @media (prefers-reduced-motion: reduce) {
   .cli-audit-spinner, .cli-audit-skeleton, .cli-audit-fade, .cli-audit-menu { animation: none; }
 }
@@ -323,6 +382,20 @@ const UI_CSS = `
 
 export default function activate(ctx) {
   const { createElement: h, useState, useEffect, useCallback } = ctx.react;
+
+  // 样式统一走 ctx.theme.injectCss：卸载插件时宿主会一并移除。
+  // 原来是把 CSS 塞进 `h('style', null, CSS)` 挂在设置面板的根节点上——
+  // 面板没打开就不生效，而且每次重渲染都在 DOM 里重建一个 <style>。
+  const cssDisposer = ctx.theme.injectCss(CSS);
+
+  /**
+   * 引擎下拉。实现在共用包 `ccgui-plugin-shared/dropdown`，构建期内联到本文件。
+   *
+   * 这里原来有一份约 140 行的内联实现（第五份手抄）：只认方向键，Home / End
+   * 之外的上翻不受控；浮层底色写的是 `var(--color-background-secondary-default, #242a35)`
+   * ——兜底是深色，浅色主题下菜单是一块深色板。接共用库把这两条一并修掉。
+   */
+  const EngineSelect = createDropdown(() => ctx.react, { prefix: 'cli' });
 
   const PLUGIN_ID = 'cli-install-audit';
   const PLUGIN_NAME = 'CLI 安装检测';
@@ -1061,6 +1134,282 @@ export default function activate(ctx) {
     };
   }
 
+  // ---- ccgui-plugin-shared/dropdown.mjs ----
+  /**
+   * 自绘下拉菜单（不用原生 <select>）。
+   *
+   * 为什么必须自绘：Windows 下 <select> 会渲染成系统控件，和宿主完全不是一套外观。
+   *
+   * 为什么放进共用包：trending / worklog / leetcode 各写了一份，129 / 156 / 129 行，
+   * 行为一致但细节已经漂开——trending 有 ✓ 勾选和 hover 同步焦点，worklog 用的是
+   * 两套 keydown handler（菜单里方向键会失效），leetcode 用文本 "▾" 而不是 CSS 箭头。
+   * 每写一个新插件就重抄一遍，所以「下拉还有问题」反复出现。
+   *
+   * 库只产出**结构和类名**，不产出 CSS：类名固定为 `${prefix}-dd-*`，
+   * 配色由各插件自己的 token 决定（自建 token 与直接用宿主 token 两条路线并存，不强行统一）。
+   * 类名清单见 DROPDOWN_CLASS_SUFFIXES，validate-core 据此检查插件有没有把 CSS 写全。
+   */
+
+  /** 下拉会产出的全部类名后缀。改这里必须同步改三个插件的 CSS。 */
+  const DROPDOWN_CLASS_SUFFIXES = Object.freeze([
+    "trigger",
+    "value",
+    "caret",
+    "scrim",
+    "menu",
+    "group",
+    "item",
+    "label",
+    "check",
+    "empty",
+  ]);
+
+  /**
+   * 浮层开合与方向。
+   *
+   * 向上弹的判断放在打开前做一次：菜单开着时再测，会把菜单自身的高度算进去。
+   */
+  function useDdPopover(R) {
+    const openState = R.useState(false);
+    const upState = R.useState(false);
+    const triggerRef = R.useRef(null);
+
+    /** 打开前估一下菜单高度：下方不够且上方更宽裕时向上弹，免得被视口裁掉。 */
+    const openPopover = (estHeight) => {
+      const el = triggerRef.current;
+      let shouldUp = false;
+      if (el && typeof el.getBoundingClientRect === "function" && typeof window !== "undefined") {
+        const rect = el.getBoundingClientRect();
+        const below = (window.innerHeight || 800) - rect.bottom;
+        shouldUp = below < estHeight + 12 && rect.top > below;
+      }
+      upState[1](shouldUp);
+      openState[1](true);
+    };
+
+    return {
+      open: openState[0],
+      setOpen: openState[1],
+      up: upState[0],
+      triggerRef,
+      openPopover,
+    };
+  }
+
+  /**
+   * 造一个 Dropdown 组件。
+   *
+   * `getR` 是**取 React 的函数**而不是 React 本身：插件的 `appCtx` 要等 activate
+   * 才赋值，顶层写 `createDropdown(appCtx.react, ...)` 拿到的是 null。
+   *
+   * 选项形状：`{ value, label, disabled?, title?, group? }`
+   *   - `disabled` 可以是布尔值，也可以是 `isDisabled(item)` 回调——语义一样，
+   *     回调那种是给「禁用条件依赖选中值或外部状态」的调用方用的。
+   *   - `title` 会落到选项的 title 属性上，用于「仅名称 / 仅手动」这类
+   *     不看说明就看不懂的取值。
+   *   - `group` 相同的连续选项前面会插一条分组标题。
+   *
+   * @param {() => object} getR  返回 { useState, useRef, useEffect, createElement }
+   * @param {{ prefix: string }} opts  prefix 决定类名，如 "gt" → gt-dd-trigger
+   */
+  function createDropdown(getR, opts) {
+    const prefix = (opts && opts.prefix) || "dd";
+    const base = prefix + "-dd";
+    const cls = (name) => base + "-" + name;
+
+    return function Dropdown(props) {
+      const R = getR();
+      const h = R.createElement;
+      const { open, setOpen, up, triggerRef, openPopover } = useDdPopover(R);
+      const focusState = R.useState(-1);
+      const focusIdx = focusState[0];
+      const setFocusIdx = focusState[1];
+      const itemRefs = R.useRef([]);
+
+      const items = Array.isArray(props.items) ? props.items : [];
+      const value = props.value == null ? "" : String(props.value);
+      const selectedIdx = items.findIndex((it) => String(it.value) === value);
+      const selected = selectedIdx >= 0 ? items[selectedIdx] : null;
+      const placeholder = props.placeholder || "请选择";
+
+      /**
+       * 统一的禁用判断。
+       *
+       * 组件里每个用到「这一项能不能选」的地方都走它，不要有的地方读
+       * `item.disabled`、有的地方调回调——两套判断迟早分叉，表现是
+       * 「灰着但能点」或「能点但方向键跳过去了」。
+       */
+      const disabledOf = (item) => {
+        if (!item) return true;
+        if (typeof props.isDisabled === "function") return Boolean(props.isDisabled(item));
+        return Boolean(item.disabled);
+      };
+
+      R.useEffect(() => {
+        if (!open) return;
+        const el = itemRefs.current[focusIdx];
+        if (el && typeof el.focus === "function") el.focus();
+      }, [open, focusIdx]);
+
+      const openMenu = () => {
+        if (props.disabled || items.length === 0) return;
+        let i = selectedIdx;
+        if (i < 0) i = items.findIndex((it) => !disabledOf(it));
+        setFocusIdx(i < 0 ? 0 : i);
+        openPopover(Math.min(260, items.length * 32 + 8));
+      };
+
+      const choose = (item) => {
+        if (!item || disabledOf(item)) return;
+        setOpen(false);
+        if (String(item.value) !== value) props.onChange(item.value);
+      };
+
+      const move = (step) => {
+        if (!items.length) return;
+        let i = focusIdx;
+        for (let n = 0; n < items.length; n += 1) {
+          i = (i + step + items.length) % items.length;
+          if (!disabledOf(items[i])) break;
+        }
+        setFocusIdx(i);
+      };
+
+      /**
+       * 键盘处理挂在**容器**上，不是 trigger 上。
+       *
+       * 菜单一打开，useEffect 会把焦点移到 option 上（option 带 tabIndex=-1），
+       * 此后按键事件从 option 冒泡到容器。只挂在 trigger 上的话，打开之后方向键、
+       * Enter 确认、Esc 关闭全部失灵——只剩鼠标能用。
+       *
+       * 容器与 trigger 不能各挂一个：同一事件会冒泡两遍，Enter 会触发两次 onChange。
+       * 所以只有一个 handler，靠 ev.target 的 className 认来源。
+       */
+      const onKeyDown = (ev) => {
+        if (props.disabled) return;
+        // 按 className 认来源，不用 triggerRef.current：ref 在假宿主/替身里
+        // 未必被赋值，一旦为 null 判断就会恒假，空格键静默失效。
+        const t = ev && ev.target;
+        const onTrigger = Boolean(
+          t && typeof t.className === "string" && t.className.split(/\s+/).includes(cls("trigger")),
+        );
+        if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+          ev.preventDefault();
+          if (!open) openMenu();
+          else move(ev.key === "ArrowDown" ? 1 : -1);
+        } else if (ev.key === "Enter") {
+          ev.preventDefault();
+          if (open) choose(items[focusIdx]);
+          else openMenu();
+        } else if (ev.key === " ") {
+          // 空格只在 trigger 上当「打开」：菜单项里按空格同理会冒泡到这里，
+          // 但那是可滚动列表，别为了这个吃掉滚动键。
+          if (onTrigger) {
+            ev.preventDefault();
+            if (open) choose(items[focusIdx]);
+            else openMenu();
+          }
+        } else if (ev.key === "Escape" && open) {
+          ev.preventDefault();
+          setOpen(false);
+          // 焦点回到触发器：菜单关上后焦点若还留在已卸载的 option 上，
+          // 浏览器会把焦点丢回 body，接着按 Tab 就得从头走一遍整页。
+          const el = triggerRef.current;
+          if (el && typeof el.focus === "function") el.focus();
+        } else if (ev.key === "Tab" && open) {
+          // 焦点会离开这个组件；scrim 是 fixed 全屏，不关掉会留下一层看不见的
+          // 遮罩继续吞点击。
+          setOpen(false);
+        }
+      };
+
+      const noItems = items.length === 0;
+
+      return h(
+        "div",
+        {
+          // className 透传：调用方常靠它做布局（`.lc-settings .lc-dd { width:100% }`）。
+          className:
+            base +
+            (props.className ? " " + props.className : "") +
+            (open ? " is-open" : "") +
+            (up ? " is-up" : ""),
+          onKeyDown,
+        },
+        h(
+          "button",
+          {
+            type: "button",
+            className: cls("trigger"),
+            ref: triggerRef,
+            // 没有选项时也禁用：点开一个空菜单只会让人以为坏了。
+            disabled: props.disabled || noItems,
+            "aria-haspopup": "listbox",
+            "aria-expanded": open,
+            onClick: () => (open ? setOpen(false) : openMenu()),
+          },
+          h(
+            "span",
+            { className: cls("value") + (selected ? "" : " is-empty") },
+            selected ? selected.label : noItems ? props.emptyText || "没有可选项" : placeholder,
+          ),
+          h("span", { className: cls("caret"), "aria-hidden": "true" }),
+        ),
+        open ? h("div", { className: cls("scrim"), onClick: () => setOpen(false) }) : null,
+        open
+          ? h(
+              "div",
+              { className: cls("menu"), role: "listbox" },
+              items.length
+                ? items.reduce((rows, item, i) => {
+                    // 分组标题：只在组名变化时插一条，且不参与键盘焦点。
+                    // 不用「值相同的项必然相邻」这种假设——按出现顺序判断，
+                    // 调用方把同组项隔开就插两条标题，那是调用方的问题，不猜。
+                    const prevGroup = i > 0 ? items[i - 1].group : undefined;
+                    if (item.group && item.group !== prevGroup) {
+                      rows.push(
+                        h("div", { key: "g:" + item.group + ":" + i, className: cls("group") }, item.group),
+                      );
+                    }
+                    const dis = disabledOf(item);
+                    rows.push(
+                      h(
+                        "div",
+                        {
+                          // value 可能重复（不同分组的同名项），带上下标才唯一。
+                          key: String(item.value) + ":" + i,
+                          ref: (el) => {
+                            itemRefs.current[i] = el;
+                          },
+                          className:
+                            cls("item") +
+                            (i === focusIdx ? " is-active" : "") +
+                            (dis ? " is-disabled" : ""),
+                          role: "option",
+                          "aria-selected": String(item.value) === value,
+                          "aria-disabled": dis ? true : undefined,
+                          // 「仅名称 / 仅手动」这类取值，不看说明判断不了，
+                          // 悬停必须给出完整含义。
+                          title: item.title || undefined,
+                          tabIndex: -1,
+                          onClick: () => choose(item),
+                          onMouseEnter: () => {
+                            if (!dis) setFocusIdx(i);
+                          },
+                        },
+                        h("span", { className: cls("label") }, item.label),
+                        h("span", { className: cls("check"), "aria-hidden": "true" }, "✓"),
+                      ),
+                    );
+                    return rows;
+                  }, [])
+                : h("div", { className: cls("empty") }, props.emptyText || "没有可选项"),
+            )
+          : null,
+      );
+    };
+  }
+
 
   /** 宿主版本。老版本宿主可能没有这一项，取不到就留空，不能因此发不出反馈。 */
   function hostAppVersion() {
@@ -1409,10 +1758,6 @@ export default function activate(ctx) {
     const [savedAt, setSavedAt] = useState(cache.savedAt);
     const [runningId, setRunningId] = useState(null);
     const [error, setError] = useState(null);
-    const [pickerFocused, setPickerFocused] = useState(false);
-    const [open, setOpen] = useState(false);
-    const [hoverId, setHoverId] = useState(null);
-    const [focusIdx, setFocusIdx] = useState(0);
     const [batch, setBatch] = useState(null);
     const [hoverBtn, setHoverBtn] = useState(null);
 
@@ -1524,73 +1869,6 @@ export default function activate(ctx) {
         lineHeight: 1,
         transition: 'background 120ms ease, opacity 120ms ease',
       },
-      trigger: {
-        display: 'flex',
-        alignItems: 'center',
-        gap: 8,
-        height: 30,
-        minWidth: 200,
-        maxWidth: 280,
-        padding: '0 10px',
-        borderRadius: 7,
-        border: '1px solid ' + (open || pickerFocused ? 'var(--color-accent-primary-default, #3b82f6)' : t.border),
-        background: open ? t.hover : 'transparent',
-        color: 'inherit',
-        fontSize: 12,
-        cursor: 'pointer',
-        outline: 'none',
-        textAlign: 'left',
-        transition: 'border-color 120ms ease, background 120ms ease',
-      },
-      triggerText: {
-        flex: '1 1 auto',
-        overflow: 'hidden',
-        textOverflow: 'ellipsis',
-        whiteSpace: 'nowrap',
-      },
-      caret: {
-        flex: 'none',
-        fontSize: 8,
-        lineHeight: 1,
-        color: t.text3,
-        transform: open ? 'rotate(180deg)' : 'none',
-        transition: 'transform 120ms ease',
-      },
-      dropdown: {
-        position: 'relative',
-        display: 'inline-flex',
-      },
-      menu: {
-        position: 'absolute',
-        top: 'calc(100% + 6px)',
-        left: 0,
-        zIndex: 50,
-        minWidth: '100%',
-        width: 'max-content',
-        maxWidth: 320,
-        padding: 4,
-        background: 'var(--color-background-secondary-default, #242a35)',
-        color: 'var(--color-text-primary, inherit)',
-        border: '1px solid ' + t.border,
-        borderRadius: 8,
-        boxShadow: '0 4px 16px rgba(0,0,0,0.12)',
-      },
-      groupTitle: {
-        padding: '6px 8px 2px',
-        fontSize: 11,
-        color: t.text3,
-        userSelect: 'none',
-      },
-      menuItem: {
-        display: 'flex',
-        alignItems: 'center',
-        gap: 8,
-        height: 28,
-        padding: '0 8px',
-        borderRadius: 6,
-        cursor: 'pointer',
-        fontSize: 12,
-      },
       btnPrimary: {
         height: 30,
         padding: '0 14px',
@@ -1626,30 +1904,7 @@ export default function activate(ctx) {
     });
     const hoverBg = (id, disabled) => (!disabled && hoverBtn === id ? t.hover : 'transparent');
 
-    const menuOrder = [...installedList, ...missingList];
-    const selectedIdx = Math.max(0, menuOrder.findIndex((e) => e.id === selectedId));
-
-    function focusOption(idx) {
-      const e = menuOrder[idx];
-      if (!e || typeof document === 'undefined') return;
-      const el = document.getElementById('cli-audit-opt-' + e.id);
-      if (el && typeof el.focus === 'function') el.focus();
-    }
-
-    function focusTrigger() {
-      if (typeof document === 'undefined') return;
-      const el = document.querySelector('[data-role="engine-trigger"]');
-      if (el && typeof el.focus === 'function') el.focus();
-    }
-
-    function openMenu() {
-      setFocusIdx(selectedIdx);
-      setOpen(true);
-    }
-
     function chooseEngine(e) {
-      setOpen(false);
-      setHoverId(null);
       if (e.id !== selectedId) setSelectedId(e.id);
       void runDetail(e.id, false);
     }
@@ -1666,15 +1921,9 @@ export default function activate(ctx) {
       setBatch(null);
     }
 
-    useEffect(() => {
-      if (!open) return;
-      focusOption(focusIdx);
-    }, [open]);
-
     const head = h(
       'div',
       { style: style.head },
-      h('style', null, UI_CSS),
       h('span', { style: { fontWeight: 600 } }, 'CLI 安装检测'),
       h(
         'button',
@@ -1759,155 +2008,30 @@ export default function activate(ctx) {
     const summaryDot =
       installedCount > 0 ? VERDICT.same.dot : VERDICT.missing.dot;
 
-    const menuItem = (e, idx) => {
-      const active = e.id === selectedId;
-      const hovered = hoverId === e.id;
-      return h(
-        'div',
-        {
-          key: e.id,
-          id: 'cli-audit-opt-' + e.id,
-          'data-engine': e.id,
-          role: 'option',
-          'aria-selected': active,
-          tabIndex: idx === focusIdx ? 0 : -1,
-          onMouseEnter: () => setHoverId(e.id),
-          onMouseLeave: () => setHoverId((cur) => (cur === e.id ? null : cur)),
-          onFocus: () => setFocusIdx(idx),
-          onKeyDown: (ev) => {
-            if (ev.key === 'ArrowDown') {
-              ev.preventDefault();
-              const n = Math.min(menuOrder.length - 1, idx + 1);
-              setFocusIdx(n);
-              focusOption(n);
-            } else if (ev.key === 'ArrowUp') {
-              ev.preventDefault();
-              const n = Math.max(0, idx - 1);
-              setFocusIdx(n);
-              focusOption(n);
-            } else if (ev.key === 'Home') {
-              ev.preventDefault();
-              setFocusIdx(0);
-              focusOption(0);
-            } else if (ev.key === 'End') {
-              ev.preventDefault();
-              const n = menuOrder.length - 1;
-              setFocusIdx(n);
-              focusOption(n);
-            } else if (ev.key === 'Enter' || ev.key === ' ') {
-              ev.preventDefault();
-              chooseEngine(e);
-            } else if (ev.key === 'Escape') {
-              ev.preventDefault();
-              setOpen(false);
-              focusTrigger();
-            } else if (ev.key === 'Tab') {
-              setOpen(false);
-            }
-          },
-          onClick: () => chooseEngine(e),
-          style: {
-            ...style.menuItem,
-            background: hovered
-              ? 'var(--color-background-tertiary-hover, rgba(127,127,127,0.15))'
-              : active
-                ? 'var(--color-background-tertiary-default, rgba(127,127,127,0.1))'
-                : 'transparent',
-            color: 'inherit',
-            fontWeight: active ? 500 : 400,
-          },
-        },
-        h(
-          'span',
-          {
-            style: {
-              width: 12,
-              flex: 'none',
-              opacity: active ? 1 : 0,
-              color: 'var(--color-accent-primary-default, #3b82f6)',
-              fontSize: 11,
-            },
-          },
-          '✓',
-        ),
-        h('span', { style: { flex: '1 1 auto' } }, e.label),
-      );
-    };
-
-    const menuBody = [];
-    let menuIdx = 0;
-    if (installedList.length > 0) {
-      menuBody.push(h('div', { key: 'h-on', style: style.groupTitle }, '已安装'));
-      for (const e of installedList) menuBody.push(menuItem(e, menuIdx++));
-    }
-    if (missingList.length > 0) {
-      menuBody.push(h('div', { key: 'h-off', style: style.groupTitle }, '未安装'));
-      for (const e of missingList) menuBody.push(menuItem(e, menuIdx++));
-    }
+    // 引擎下拉的选项。共用库的选项形状是 { value, label, group }：
+    // 相邻同组项前面只插一条分组标题，不用自己拼 div。
+    const pickerItems = [
+      ...installedList.map((e) => ({ value: e.id, label: e.label, group: '已安装' })),
+      ...missingList.map((e) => ({ value: e.id, label: e.label, group: '未安装' })),
+    ];
 
     const picker = h(
       'div',
       { style: { ...style.card, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
       h('span', { style: { ...style.meta, flex: 'none' } }, '引擎'),
-      h(
-        'div',
-        { style: style.dropdown },
-        h(
-          'button',
-          {
-            type: 'button',
-            'data-role': 'engine-trigger',
-            'aria-haspopup': 'listbox',
-            'aria-expanded': open,
-            'aria-controls': open ? 'cli-audit-engine-menu' : undefined,
-            style: {
-              ...style.trigger,
-              background:
-                open || (!batchRunning && hoverBtn === 'trigger') ? t.hover : 'transparent',
-              opacity: batchRunning ? 0.55 : 1,
-              cursor: batchRunning ? 'not-allowed' : 'pointer',
-            },
-            disabled: batchRunning,
-            ...btnHover('trigger', batchRunning),
-            onFocus: () => setPickerFocused(true),
-            onBlur: () => setPickerFocused(false),
-            onClick: () => {
-              if (open) setOpen(false);
-              else openMenu();
-            },
-            onKeyDown: (ev) => {
-              if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
-                ev.preventDefault();
-                if (!open) openMenu();
-              } else if (ev.key === 'Enter' || ev.key === ' ') {
-                ev.preventDefault();
-                if (open) setOpen(false);
-                else openMenu();
-              } else if (ev.key === 'Escape' && open) {
-                ev.preventDefault();
-                setOpen(false);
-              }
-            },
-          },
-          h('span', { style: style.triggerText }, selected ? selected.label : '选择引擎'),
-          h('span', { style: style.caret }, '▼'),
-        ),
-        open &&
-          h(
-            'div',
-            {
-              id: 'cli-audit-engine-menu',
-              className: 'cli-audit-menu',
-              style: style.menu,
-              role: 'listbox',
-              'data-role': 'engine-menu',
-              'aria-activedescendant': menuOrder[focusIdx]
-                ? 'cli-audit-opt-' + menuOrder[focusIdx].id
-                : undefined,
-            },
-            menuBody,
-          ),
-      ),
+      h(EngineSelect, {
+        items: pickerItems,
+        value: selectedId,
+        placeholder: '选择引擎',
+        emptyText: '没有可用的引擎',
+        // 批量检测期间禁用：中途换引擎会让「正在检测 n/N」指向错的对象。
+        disabled: batchRunning,
+        title: selected ? '当前引擎：' + selected.label : '选择要检测的引擎',
+        onChange: (id) => {
+          const picked = ordered.find((x) => x.id === id);
+          if (picked) chooseEngine(picked);
+        },
+      }),
       h(
         'button',
         {
@@ -1951,12 +2075,6 @@ export default function activate(ctx) {
           isRunning && !batchRunning ? '检测中…' : hasResult ? '重新检测' : '检测',
         ),
       ),
-      // 点击任意空白处收起下拉
-      open &&
-        h('div', {
-          style: { position: 'fixed', inset: 0, zIndex: 40 },
-          onClick: () => setOpen(false),
-        }),
     );
 
     let body = null;
@@ -2107,6 +2225,7 @@ export default function activate(ctx) {
     if (typeof d === 'function') disposers.push(d);
     return d;
   };
+  remember(cssDisposer);
 
   remember(
     ctx.ui.registerSettingsSection({

@@ -52,14 +52,23 @@ const httpCalls = [];
 let httpResponder = null;
 // 让 plugin_exec_run 失败，用来验证「扫描失败」分支里反馈入口还在
 let execFails = false;
+// discover 返回的引擎列表。默认空；验下拉时换成一装有、一未装。
+let engineList = [];
 let settingsDef = null;
 let commandDef = null;
+let injectedCss = '';
 
 const ctx = {
   react: fakeReact,
   pluginId: MANIFEST.id,
   version: MANIFEST.version,
   host: { sdkVersion: '0.3.25', appVersion: '1.2.4', locale: 'zh-CN', isWeb: false },
+  theme: {
+    injectCss: (css) => {
+      injectedCss += css;
+      return () => {};
+    },
+  },
   storage: {
     get: async (k) => (storageData.has(k) ? storageData.get(k) : null),
     set: async (k, v) => {
@@ -90,8 +99,8 @@ const ctx = {
       }
       if (name !== 'plugin_exec_run') throw new Error('unexpected command ' + name);
       if (execFails) throw new Error('powershell 不可用');
-      // PowerShell 在本冒烟里不真跑：返回空发现结果
-      return { code: 0, stdout: JSON.stringify({ engines: [] }), stderr: '' };
+      // PowerShell 在本冒烟里不真跑：只回 discover 的引擎清单
+      return { code: 0, stdout: JSON.stringify({ engines: engineList }), stderr: '' };
     },
   },
 };
@@ -116,6 +125,14 @@ check('注册了设置页与命令入口', () => {
   assert.ok(settingsDef, 'settings section');
   assert.ok(commandDef, 'command');
   assert.equal(settingsDef.label(), 'CLI 安装检测');
+});
+
+check('样式走 ctx.theme.injectCss，不塞 h("style")', () => {
+  // 原来挂在设置面板根节点的 <style> 在面板没打开时不生效，重渲染还会重建。
+  assert.ok(injectedCss.includes('.cli-dd-menu'), '应注入下拉样式');
+  // 反馈区是自绘 + 内联 style，CSS 里只有动画那几个类。
+  assert.ok(injectedCss.includes('.cli-audit-spinner'), '应注入动画样式');  const { tree } = renderFresh(settingsDef.component);
+  assert.equal(findAll(tree, (n) => n && n.type === 'style').length, 0, '不应出现 <style> 节点');
 });
 
 const okQuota = () => ({ status: 200, body: JSON.stringify({ remaining: 1, dailyLimit: 1, fallbackRemaining: 3 }) });
@@ -321,6 +338,61 @@ await (async () => {
   });
   execFails = false;
   dispose3();
+})();
+
+// 引擎下拉：结构与类名来自共用包，本插件只补 CSS。
+// 旧的 140 行内联实现在这次改造里删掉了，这里钉住「确实换成了库」与
+// 「库承诺的键盘契约还在」，避免以后有人又手抄一份进来。
+await (async () => {
+  engineList = [
+    { id: 'claude', label: 'Claude Code', cmds: ['claude'], resolved: ['C:/bin/claude.exe'] },
+    { id: 'codex', label: 'Codex', cmds: ['codex'], resolved: [] },
+  ];
+  const dispose4 = mod.default(ctx);
+  await mountFeedback(okQuota);
+  // discover 是 effect 里跑的，多渲染几轮让它落定
+  for (let i = 0; i < 4; i += 1) {
+    await sleep(40);
+    snap();
+  }
+  const tree = snap();
+
+  check('下拉：引擎选择器来自共用库（cli-dd-*）', () => {
+    const trigger = byClass(tree, 'cli-dd-trigger');
+    assert.ok(trigger, '应有共用库产出的触发器');
+    assert.equal(trigger.type, 'button', '触发器必须是 button，不能用原生 select');
+    assert.equal(findAll(tree, (n) => n && n.type === 'select').length, 0, '不允许原生 select');
+    assert.equal(textOf(trigger).indexOf('Claude Code') >= 0, true, '当前值应显示已选引擎');
+  });
+
+  check('下拉：键盘处理挂在容器上，方向键与 Esc 才冒泡得到', () => {
+    const box = byClass(tree, 'cli-dd');
+    assert.ok(box, '应有下拉容器');
+    assert.equal(typeof box.props.onKeyDown, 'function', '容器必须挂 onKeyDown');
+    // 旧实现把按键挂在 trigger 与每个 option 各一份，Enter 会走两遍；
+    // 库只在容器上挂一份，靠 ev.target.className 认来源。
+    const trigger = byClass(tree, 'cli-dd-trigger');
+    assert.equal(trigger.props.onKeyDown, undefined, 'trigger 上不该再有第二个 handler');
+  });
+
+  check('下拉：已安装 / 未安装分组都在，且选项可点', () => {
+    const trigger = byClass(tree, 'cli-dd-trigger');
+    trigger.props.onClick();
+    const open = snap();
+    const items = findAll(open, (n) => {
+      const c = n && n.props && n.props.className;
+      return typeof c === 'string' && c.split(/\s+/).includes('cli-dd-item');
+    });
+    assert.equal(items.length, 2, '应有两条引擎选项');
+    const groups = findAll(open, (n) => {
+      const c = n && n.props && n.props.className;
+      return typeof c === 'string' && c.split(/\s+/).includes('cli-dd-group');
+    }).map(textOf);
+    assert.deepEqual(groups, ['已安装', '未安装'], '分组标题应按安装状态分两段');
+  });
+
+  dispose4();
+  engineList = [];
 })();
 
 /* ------------------------------------------------------------ 汇总 */

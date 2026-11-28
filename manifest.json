@@ -25,6 +25,7 @@
     "ui:command",
     "exec:powershell",
     "storage",
+    "theme",
     "network:ccgui-feedback.2653990378.workers.dev"
   ]
 }
